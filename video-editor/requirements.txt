@@ -1,0 +1,41 @@
+Flask>=3.0,<4
+Flask-Cors>=4.0,<5
+Werkzeug>=3.0,<4
+yt-dlp[default]>=2026.3.17
+faster-whisper>=1.0.0,<2
+deep-translator>=1.11.4,<2
+
+# Pillow: medicion exacta de ancho de titulos (anti-overflow lateral).
+# Si no esta, hay un fallback heuristico calibrado para Montserrat Black.
+Pillow>=10.0.0,<12
+
+# stable-ts (opcional): realinea timestamps de Whisper por silencios reales.
+# Mejora notoria de la sincronia de subtitulos. Si no se instala, el
+# transcriber usa faster-whisper puro con VAD estricto, que tambien funciona.
+# Para activar simplemente: pip install stable-ts
+# stable-ts>=2.17.0,<3
+
+# --- CUDA support para faster-whisper en GPU ---
+# Estos wheels traen las DLLs de cuDNN 8 y cuBLAS de CUDA 12 dentro del venv.
+# CTranslate2 (motor de faster-whisper) esta compilado contra CUDA 12, asi que
+# las usa automaticamente cuando estan presentes. NO requieren CUDA Toolkit
+# instalado a nivel sistema. Solo necesitas drivers NVIDIA (ya vienen con la GPU).
+# IMPORTANTE: NO instales CUDA Toolkit 13.x; rompe la compatibilidad.
+nvidia-cublas-cu12; sys_platform == 'win32'
+nvidia-cudnn-cu12==8.9.7.29; sys_platform == 'win32'
+
+# DeepFilterNet 3 - speech enhancement SOTA (modelo ~3MB, CPU real-time).
+# Limita packaging porque deepfilterlib pide <24 y wheel >=24.
+deepfilternet>=0.5.6
+packaging>=23.0,<24.0
+# pedalboard (Spotify) - pitch shift profesional sin efecto chipmunk.
+# Trae Rubberband bundled, preserva formantes vocales (voz natural al cambiar tono).
+pedalboard>=0.9.0
+# Praat (parselmouth) - voice gender/character change real (mujer suena mujer).
+# Shiftea pitch + formantes por separado. La herramienta que usan los fonetistas.
+praat-parselmouth>=0.4.3
+# WhisperX - forced alignment con wav2vec2 para timestamps de subtitulos.
+# Pulla torch + pyannote ~700MB+. Ya instalado, no romper la version.
+whisperx>=3.3.0
+# setuptools fijado a <82 porque torch 2.11 lo requiere.
+setuptools<82

@@ -1,0 +1,48 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+.venv
+.env
+.env.local
+.tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+assets/uploads/*
+assets/outputs/*
+assets/outputs/.workfast_tmp/
+assets/library/logo/*
+assets/library/follow/*
+assets/library/ending/*
+assets/library/youtube_cookies.txt
+assets/library/openai_key.txt
+assets/library/youtube_chrome_profile/
+assets/library/profiles.json
+!assets/uploads/.gitkeep
+!assets/outputs/.gitkeep
+!assets/library/logo/.gitkeep
+!assets/library/follow/.gitkeep
+!assets/library/ending/.gitkeep
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Logs
+*.log
+logs/
