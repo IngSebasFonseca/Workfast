@@ -1,8 +1,12 @@
 .venv/
+.claude/
 video-editor/venv/
 video-editor/.venv/
 video-editor/.env
 video-editor/.tmp/
+video-editor/.workfast_tmp/
+video-editor/assets/.cache/
+video-editor/assets/tools/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -22,7 +26,14 @@ video-editor/assets/library/youtube_cookies.txt
 video-editor/assets/library/facebook_cookies.txt
 video-editor/assets/library/openai_key.txt
 video-editor/assets/library/youtube_chrome_profile/
+video-editor/assets/library/subtitle_cache/
+video-editor/assets/library/qwen3_tts_cache/
+video-editor/assets/library/voice_models/**/*.pth
+video-editor/assets/library/voice_models/**/*.index
+video-editor/assets/library/voice_models/**/*.onnx
+video-editor/assets/library/voice_models/**/*.safetensors
 video-editor/assets/library/profiles.json
+video-editor/assets/library/*.bak
 !video-editor/assets/uploads/.gitkeep
 !video-editor/assets/outputs/.gitkeep
 !video-editor/assets/library/logo/.gitkeep
@@ -34,3 +45,4 @@ video-editor/assets/library/profiles.json
 *.mkv
 video-editor/test.js
 video-editor/test_output.txt
+.env

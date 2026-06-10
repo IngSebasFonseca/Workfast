@@ -1,5 +1,5 @@
 # Video Processor Package
-from .editor import VideoEditor
+from .editor import VideoEditor, RenderCancelled
 from .subtitles import Phrase, Word, build_ass, group_words_into_phrases, write_ass_file
 from .transcriber import (
     TranscriberError,
@@ -12,6 +12,7 @@ from .transcriber import (
 
 __all__ = [
     "Phrase",
+    "RenderCancelled",
     "TranscriberError",
     "VideoEditor",
     "Word",

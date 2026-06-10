@@ -1,0 +1,43 @@
+{
+  "_note": "Lista pre-curada de canales sugeridos por idioma+nicho. Edita libremente.",
+  "_format": "url, name, language (en/de/pt/es/fr), niche (reddit/curiosities/true_crime/sitcom/motivational/cooking/animals/history), platform, followers (opcional)",
+  "channels": [
+    { "url": "https://www.youtube.com/@RSlash/shorts", "name": "rSlash", "language": "en", "niche": "reddit", "platform": "youtube", "followers": 3500000 },
+    { "url": "https://www.youtube.com/@StorytimeAnimated/shorts", "name": "Storytime Animated", "language": "en", "niche": "reddit", "platform": "youtube", "followers": 7800000 },
+    { "url": "https://www.youtube.com/@redditbros/shorts", "name": "Reddit Bros", "language": "en", "niche": "reddit", "platform": "youtube", "followers": 1200000 },
+    { "url": "https://www.tiktok.com/@reddit.stories", "name": "Reddit Stories TT", "language": "en", "niche": "reddit", "platform": "tiktok" },
+    { "url": "https://www.youtube.com/@TheInfographicsShow/shorts", "name": "The Infographics Show", "language": "en", "niche": "curiosities", "platform": "youtube", "followers": 17000000 },
+    { "url": "https://www.youtube.com/@BeAmazed/shorts", "name": "BE AMAZED", "language": "en", "niche": "curiosities", "platform": "youtube", "followers": 12000000 },
+    { "url": "https://www.tiktok.com/@didyouknowfacts", "name": "Did You Know Facts", "language": "en", "niche": "curiosities", "platform": "tiktok" },
+    { "url": "https://www.youtube.com/@BuzzFeedUnsolvedNetwork/shorts", "name": "BuzzFeed Unsolved", "language": "en", "niche": "true_crime", "platform": "youtube" },
+    { "url": "https://www.youtube.com/@CrimeWeekly/shorts", "name": "Crime Weekly", "language": "en", "niche": "true_crime", "platform": "youtube", "followers": 900000 },
+    { "url": "https://www.youtube.com/@TBBTclips/shorts", "name": "TBBT Clips", "language": "en", "niche": "sitcom", "platform": "youtube" },
+    { "url": "https://www.youtube.com/@FRIENDSclips/shorts", "name": "FRIENDS Best Moments", "language": "en", "niche": "sitcom", "platform": "youtube" },
+    { "url": "https://www.youtube.com/@MotivationHub/shorts", "name": "MotivationHub", "language": "en", "niche": "motivational", "platform": "youtube", "followers": 4200000 },
+    { "url": "https://www.youtube.com/@TastyShorts/shorts", "name": "Tasty Shorts", "language": "en", "niche": "cooking", "platform": "youtube", "followers": 21000000 },
+    { "url": "https://www.tiktok.com/@gordonramsayofficial", "name": "Gordon Ramsay", "language": "en", "niche": "cooking", "platform": "tiktok" },
+    { "url": "https://www.tiktok.com/@dogsofinstagram", "name": "Dogs Of Instagram", "language": "en", "niche": "animals", "platform": "tiktok" },
+    { "url": "https://www.youtube.com/@Simplehistory/shorts", "name": "Simple History", "language": "en", "niche": "history", "platform": "youtube", "followers": 5300000 },
+
+    { "url": "https://www.youtube.com/@RedditDeutsch/shorts", "name": "Reddit Deutsch", "language": "de", "niche": "reddit", "platform": "youtube" },
+    { "url": "https://www.youtube.com/@WissenswertesAufDeutsch/shorts", "name": "Wissenswertes auf Deutsch", "language": "de", "niche": "curiosities", "platform": "youtube" },
+    { "url": "https://www.youtube.com/@WeltDerWunder/shorts", "name": "Welt der Wunder", "language": "de", "niche": "curiosities", "platform": "youtube", "followers": 800000 },
+    { "url": "https://www.youtube.com/@MrWissen2go/shorts", "name": "MrWissen2go", "language": "de", "niche": "history", "platform": "youtube", "followers": 1800000 },
+    { "url": "https://www.tiktok.com/@verbrechenpodcast", "name": "Verbrechen Podcast", "language": "de", "niche": "true_crime", "platform": "tiktok" },
+
+    { "url": "https://www.youtube.com/@HistoriasdoReddit/shorts", "name": "Histórias do Reddit", "language": "pt", "niche": "reddit", "platform": "youtube" },
+    { "url": "https://www.youtube.com/@VocesabiaQue/shorts", "name": "Você Sabia?", "language": "pt", "niche": "curiosities", "platform": "youtube", "followers": 28000000 },
+    { "url": "https://www.youtube.com/@CasosFamososBR/shorts", "name": "Casos Famosos BR", "language": "pt", "niche": "true_crime", "platform": "youtube" },
+    { "url": "https://www.tiktok.com/@receitasrapidasbr", "name": "Receitas Rápidas BR", "language": "pt", "niche": "cooking", "platform": "tiktok" },
+    { "url": "https://www.youtube.com/@AtilaIamarinoBR/shorts", "name": "Atila Iamarino", "language": "pt", "niche": "history", "platform": "youtube" },
+
+    { "url": "https://www.youtube.com/@CuriosidadesEnEspañol/shorts", "name": "Curiosidades en Español", "language": "es", "niche": "curiosities", "platform": "youtube" },
+    { "url": "https://www.youtube.com/@HistoriasReddit/shorts", "name": "Historias Reddit ES", "language": "es", "niche": "reddit", "platform": "youtube" },
+    { "url": "https://www.tiktok.com/@criminologo", "name": "Criminólogo", "language": "es", "niche": "true_crime", "platform": "tiktok" },
+    { "url": "https://www.youtube.com/@TheBigBangTheoryESP/shorts", "name": "TBBT España", "language": "es", "niche": "sitcom", "platform": "youtube" },
+
+    { "url": "https://www.youtube.com/@RedditFR/shorts", "name": "Reddit FR", "language": "fr", "niche": "reddit", "platform": "youtube" },
+    { "url": "https://www.youtube.com/@JaminTV/shorts", "name": "Jamin TV", "language": "fr", "niche": "curiosities", "platform": "youtube" },
+    { "url": "https://www.youtube.com/@ChroniquesCriminelles/shorts", "name": "Chroniques Criminelles", "language": "fr", "niche": "true_crime", "platform": "youtube" }
+  ]
+}

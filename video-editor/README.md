@@ -1,98 +1,84 @@
-# WorkFast Video Editor
+# WorkFast / Evse Video Studio
 
-App local para automatizar un preset de edicion estilo CapCut/Filmora para videos verticales de redes sociales.
+App local para producir videos verticales 9:16 para TikTok, Reels y Shorts con
+flujo automatico: importacion, branding, mejora IA, subtitulos, audio limpio y
+render por GPU.
 
-## Que hace
+Para estado completo, diagnostico y roadmap tecnico, lee:
 
-- Exporta un maestro vertical 9:16, 1080x1920 a 60 fps para TikTok, Facebook Reels y YouTube Shorts.
-- Video de alta tasa: objetivo 40 Mbps, maximo 60 Mbps, buffer 80 Mbps.
-- Usa NVIDIA NVENC automaticamente si FFmpeg detecta una GPU compatible.
-- Duplica el video en dos capas.
-- Capa inferior: espejo horizontal, zoom 196%, saturacion alta y desvanecimiento suave.
-- Capa superior: zoom 96%, filtro HD ligero y enfoque.
-- Acelera video y audio a 1.05x.
-- Audio: +5.4 dB, reduccion de ruido, filtros de voz y limitador.
-- Logo con movimiento de izquierda a derecha durante todo el video.
-- Titulo centrado con fondo negro y texto verde cada 10 segundos.
-- Imagen "sigueme" en intervalos.
-- Ending opcional al final.
-- Barra de progreso real por job.
-- Cola de hasta 5 videos con descarga individual o ZIP.
-- Los videos exportados usan el titulo como nombre de archivo.
-- Importacion desde YouTube: pega un canal, playlist o video, elige uno e importalo como video principal.
-- Sesion de YouTube desde Edge, Chrome, Firefox o Brave cuando YouTube pide confirmar que no eres bot.
-- Audio HD: denoise, EQ de voz, compresion, loudness y AAC 320 kbps.
-- Perfiles de marca: cada persona crea su perfil y guarda logo, imagen de sigueme y ending.
-- Opcion para ocultar subtitulos ya pegados en la franja inferior; las pistas de subtitulos embebidas no se copian al exportar.
-- Subtitulos IA opcionales con OpenAI: transcribe, traduce a espanol/ingles/portugues y puede quemarlos dentro del MP4 final.
+```text
+ESTADO_ACTUAL_WORKFAST.md
+```
+
+## Inicio rapido
+
+En Windows:
+
+```text
+Abrir WorkFast.bat
+```
+
+Tambien existe:
+
+```text
+Abrir Evse.bat
+```
+
+Ambos llaman a `start.bat`, preparan el entorno y abren:
+
+```text
+http://127.0.0.1:5000
+```
+
+## Capacidades actuales
+
+- Exporta vertical 1080x1920 a 60 fps.
+- Usa NVIDIA NVENC si esta disponible.
+- Perfil RTX HQ para la RTX 5070.
+- Mejora IA de video con Real-ESRGAN y RIFE ncnn-vulkan.
+- Subtitulos IA locales con Whisper `large-v3` + `stable-ts` en modo pro.
+- Traduccion de subtitulos a espanol, ingles y portugues.
+- Subtitulos y mejora IA corren en paralelo cuando ambas opciones estan activas.
+- Audio limpio con DeepFilterNet + cadena `voice_pro`.
+- Presets de voz: original, Qwen3-TTS mujer/hombre y fallback local rapido.
+- Qwen3-TTS local configurado como texto-a-voz para reemplazar la narracion.
+- Hook listo para RVC/OpenVoice u otro conversor neuronal con `WORKFAST_VOICE_CONVERTER_CMD`.
+- Cola de hasta 20 videos.
+- Perfiles de marca con logo, imagen de sigueme y ending.
+- Importacion desde YouTube/TikTok/Facebook mediante yt-dlp y cookies locales.
 
 ## Requisitos
 
 - Windows 10/11.
-- Python 3.10 o superior.
-- FFmpeg y ffprobe disponibles en PATH.
-- Node.js 20 o superior para resolver los retos JavaScript actuales de YouTube.
+- Python 3.10 o 3.11 de python.org.
+- FFmpeg y ffprobe en PATH.
+- Driver NVIDIA actualizado.
+- Node.js 20+ ayuda con retos actuales de YouTube/yt-dlp.
 
-Para comprobar FFmpeg:
+## Comandos utiles
 
-```powershell
-ffmpeg -version
-ffprobe -version
-```
-
-## Inicio rapido para usar
-
-Haz doble clic en `Abrir WorkFast.bat`.
-El archivo inicia el servidor si hace falta y abre `http://127.0.0.1:5000` en el navegador.
-
-## Uso
-
-1. Sube el video principal.
-2. O pega un link de YouTube, pulsa `Cargar` e importa el video que quieras.
-3. Crea o selecciona un perfil.
-4. Sube o elige logo, sigueme y ending para ese perfil.
-5. El titulo se llena con el nombre del video importado/subido y puedes editarlo.
-6. Opcional: configura `OPENAI_API_KEY` en `.env` y activa `Generar subtitulos nuevos`.
-7. Pulsa `Procesar cola`.
-8. Revisa la barra de progreso.
-9. Descarga el resultado cuando termine.
-
-Usa la importacion de YouTube solo con contenido propio, con permiso o con derechos de uso para tus redes.
-El modo `Auto` intenta primero sin sesion, como el flujo inicial que ya funcionaba, y luego usa la sesion guardada si existe.
-Si YouTube muestra `Sign in to confirm you're not a bot`, pulsa `Abrir login`, inicia sesion en la ventana de Chrome de WorkFast y luego pulsa `Guardar sesion`.
-La sesion se guarda localmente como `assets/library/youtube_cookies.txt`; no se sube a GitHub.
-Tambien puedes subir un archivo Netscape `cookies.txt` manualmente con `Subir cookies`.
-
-Los videos subidos y generados se guardan localmente en:
-
-- `assets/uploads`
-- `assets/outputs`
-
-Esas carpetas estan ignoradas por Git para no subir tus videos privados.
-
-## Fase 2
-
-El plan de ejecucion para subtitulos tipo Opus Clips, traducciones por idioma y clips automaticos desde videos largos esta en:
-
-```text
-ROADMAP_PHASE_2.md
-```
-
-## Desarrollo
-
-Instalacion manual:
+Instalar dependencias manualmente:
 
 ```powershell
 python -m venv venv
 venv\Scripts\activate
 python -m pip install -r requirements.txt
-python backend\main.py
 ```
 
-Prueba de humo:
+Arrancar backend manualmente:
 
 ```powershell
-python scripts\smoke_test.py
+venv\Scripts\python.exe -B backend\main.py
+```
+
+Verificar:
+
+```powershell
+venv\Scripts\python.exe -m pip check
+venv\Scripts\python.exe -m compileall -q backend scripts
+venv\Scripts\python.exe scripts\test_text_and_subs.py
+venv\Scripts\python.exe scripts\test_enhancer_e2e.py
+venv\Scripts\python.exe scripts\smoke_test.py
 ```
 
 ## Estructura
@@ -100,12 +86,45 @@ python scripts\smoke_test.py
 ```text
 backend/
   main.py
-  video_processor/editor.py
+  video_processor/
+    editor.py
+    enhancer.py
+    transcriber.py
+    subtitles.py
+    audio_enhancer.py
 frontend/
   index.html
 assets/
+  fonts/
+  library/
   uploads/
   outputs/
-requirements.txt
-start.bat
+  tools/
+scripts/
+  smoke_test.py
+  test_text_and_subs.py
+  test_enhancer_e2e.py
+```
+
+## Datos locales
+
+Estas carpetas pueden contener archivos importantes del usuario:
+
+- `assets/uploads`
+- `assets/outputs`
+- `assets/library`
+
+No las borres sin revisar. Estan ignoradas por Git para no subir videos,
+perfiles, cookies ni datos privados.
+
+## Nota de voz IA
+
+Qwen3-TTS transcribe el audio original, genera una pista nueva con una voz
+mujer/hombre y ajusta la duracion al video. Es texto-a-voz, no voice-to-voice
+labial exacto. Para conversion de voz neuronal pura tipo RVC/OpenVoice, configura
+un motor externo con modelos o voces legales mediante:
+
+```text
+WORKFAST_VOICE_CONVERTER_CMD
+WORKFAST_VOICE_REFERENCE
 ```

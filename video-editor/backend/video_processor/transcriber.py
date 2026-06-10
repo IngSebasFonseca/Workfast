@@ -19,11 +19,15 @@ from .subtitles import Phrase, Word, build_ass, group_words_into_phrases
 ProgressCallback = Callable[[int, str], None]
 
 LOGGER = logging.getLogger(__name__)
+_MPL_CONFIG_DIR = Path(__file__).resolve().parents[2] / "assets" / ".cache" / "matplotlib"
+_MPL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_MPL_CONFIG_DIR))
+_CUDA_DLL_HANDLES: list[object] = []
 
 
 def _setup_cuda_dll_paths() -> None:
     """En Windows, agrega los paths de los wheels NVIDIA al DLL search.
-    
+
     Los paquetes pip nvidia-cudnn-cu12 y nvidia-cublas-cu12 traen sus DLLs en
     site-packages/nvidia/cudnn/bin y site-packages/nvidia/cublas/bin.
     Si las agregamos al PATH de DLLs antes de importar faster-whisper,
@@ -34,11 +38,18 @@ def _setup_cuda_dll_paths() -> None:
     if not hasattr(os, "add_dll_directory"):  # Python 3.7-
         return
     candidates: list[Path] = []
-    for module_name, subdir in [("nvidia.cudnn", "bin"), ("nvidia.cublas", "bin")]:
+    for module_name, subdir in [
+        ("nvidia.cudnn", "bin"),
+        ("nvidia.cublas", "bin"),
+        ("nvidia.cuda_nvrtc", "bin"),
+    ]:
         try:
             mod = __import__(module_name, fromlist=["__file__"])
-            if mod.__file__:
-                dll_dir = Path(mod.__file__).parent / subdir
+            module_paths = list(getattr(mod, "__path__", []) or [])
+            if getattr(mod, "__file__", None):
+                module_paths.append(str(Path(mod.__file__).parent))
+            for module_path in module_paths:
+                dll_dir = Path(module_path) / subdir
                 if dll_dir.exists():
                     candidates.append(dll_dir)
         except ImportError:
@@ -46,8 +57,12 @@ def _setup_cuda_dll_paths() -> None:
         except Exception as exc:
             LOGGER.debug("No pude resolver %s: %s", module_name, exc)
     for path in candidates:
+        path_str = str(path)
+        current_path = os.environ.get("PATH", "")
+        if path_str.lower() not in current_path.lower():
+            os.environ["PATH"] = path_str + os.pathsep + current_path
         try:
-            os.add_dll_directory(str(path))
+            _CUDA_DLL_HANDLES.append(os.add_dll_directory(path_str))
             LOGGER.debug("Agregado al DLL path: %s", path)
         except (OSError, FileNotFoundError):
             pass
@@ -56,45 +71,143 @@ def _setup_cuda_dll_paths() -> None:
 _setup_cuda_dll_paths()
 
 
-# Modelos disponibles: tiny (39MB), base (74MB), small (244MB), medium (769MB), large-v3 (1550MB)
-# Para GTX 1650 Ti 4GB: small en CPU, medium en GPU (si CUDA disponible)
-DEFAULT_MODEL = os.getenv("WORKFAST_WHISPER_MODEL", "small")
+# Modelos disponibles: tiny, base, small, medium, large-v3.
+# En RTX 5070 12 GB usamos large-v3 + batch CUDA por defecto.
+DEFAULT_MODEL = os.getenv("WORKFAST_WHISPER_MODEL") or "auto"
 # auto: usa CUDA si las DLLs estan cargables, sino CPU. Cambia a "cpu" para forzar CPU
 DEFAULT_DEVICE = os.getenv("WORKFAST_WHISPER_DEVICE", "auto")
 DEFAULT_COMPUTE = os.getenv("WORKFAST_WHISPER_COMPUTE", "auto")
+
+
+def _subtitle_mode() -> str:
+    return os.getenv("WORKFAST_SUBTITLE_MODE", "pro").strip().lower()
+
+
+def _nvidia_gpu_info() -> dict:
+    """Read a lightweight GPU profile from nvidia-smi when available."""
+    if shutil.which("nvidia-smi") is None:
+        return {}
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except Exception:
+        return {}
+    if result.returncode != 0 or not result.stdout.strip():
+        return {}
+    parts = [part.strip() for part in result.stdout.splitlines()[0].split(",")]
+    if len(parts) < 2:
+        return {}
+    try:
+        memory_mb = int(float(parts[1]))
+    except ValueError:
+        memory_mb = 0
+    return {
+        "name": parts[0],
+        "memory_mb": memory_mb,
+        "driver_version": parts[2] if len(parts) > 2 else "",
+    }
+
+
+def _resolve_model(requested: str, device: str | None = None) -> str:
+    if requested and requested != "auto":
+        return requested
+    if device == "cpu":
+        return "small"
+    gpu = _nvidia_gpu_info()
+    memory_mb = int(gpu.get("memory_mb") or 0)
+    name = str(gpu.get("name") or "").lower()
+    if memory_mb >= 10_000 and "nvidia" in name:
+        return "large-v3"
+    if memory_mb >= 6_000 and "nvidia" in name:
+        return "medium"
+    return "small"
+
+
+def _resolve_batch_size(device: str) -> int:
+    if device != "cuda":
+        return 1
+    requested = os.getenv("WORKFAST_WHISPER_BATCH_SIZE")
+    if requested:
+        try:
+            return max(1, min(32, int(requested)))
+        except ValueError:
+            LOGGER.warning("WORKFAST_WHISPER_BATCH_SIZE invalido: %s", requested)
+    memory_mb = int(_nvidia_gpu_info().get("memory_mb") or 0)
+    if memory_mb >= 16_000:
+        return 16
+    if memory_mb >= 10_000:
+        return 8
+    if memory_mb >= 6_000:
+        return 4
+    return 1
+
+
+def _use_batched_pipeline(device: str) -> bool:
+    if os.getenv("WORKFAST_WHISPER_BATCHED", "1") == "0":
+        return False
+    return device == "cuda" and _resolve_batch_size(device) > 1
 
 
 def describe_backend() -> dict:
     """Retorna info del backend que se usaria. Util para mostrar al usuario."""
     device = _resolve_device(DEFAULT_DEVICE)
     compute = _resolve_compute_type(device, DEFAULT_COMPUTE)
+    model = _resolve_model(DEFAULT_MODEL, device)
+    gpu = _nvidia_gpu_info()
     cuda_ok = _cuda_available()
     cuda13_warning = _has_incompatible_cuda13()
+    whisperx_ok = _whisperx_available()
+    stable_ts_ok = _stable_ts_enabled() and not whisperx_ok
+    if whisperx_ok:
+        pipeline = "whisperx-forced-align"
+        alignment = "forced"
+    elif stable_ts_ok:
+        pipeline = "stable-ts+faster-whisper"
+        alignment = "stabilized-word-timestamps"
+    else:
+        pipeline = "faster-whisper-batched" if _use_batched_pipeline(device) else "faster-whisper"
+        alignment = "word-timestamps"
     if device == "cuda":
-        hint = "Usando CUDA (rápido)"
+        aligner = "WhisperX" if whisperx_ok else ("stable-ts" if stable_ts_ok else "faster-whisper")
+        hint = f"Usando CUDA con {model} + {aligner}."
     elif cuda13_warning:
         hint = (
-            "Detecté CUDA 13 instalado pero faster-whisper requiere CUDA 12. "
-            "Desinstala CUDA 13 desde Panel de control. Las DLLs de CUDA 12 "
-            "vienen incluidas en los wheels pip nvidia-cudnn-cu12 y nvidia-cublas-cu12."
+            "Detecte librerias CUDA 13 en PATH, pero faster-whisper/CTranslate2 "
+            "usa runtime CUDA 12 + cuDNN 9. Si CUDA falla, quita CUDA Toolkit 13 "
+            "del PATH y deja que el venv use nvidia-cudnn-cu12 + nvidia-cublas-cu12."
         )
     elif cuda_ok is False and DEFAULT_DEVICE == "auto":
         hint = (
             "Usando CPU. Para activar GPU: el proyecto incluye los wheels pip "
             "nvidia-cudnn-cu12 + nvidia-cublas-cu12. Cierra y reabre Abrir WorkFast.bat "
-            "para que se instalen automaticamente. NO necesitas instalar CUDA Toolkit."
+            "para que se instalen automaticamente. NO necesitas CUDA Toolkit."
         )
     else:
         hint = "Usando CPU."
     return {
-        "model": DEFAULT_MODEL,
+        "model": model,
+        "model_source": "auto" if DEFAULT_MODEL == "auto" else "env",
         "device": device,
         "compute_type": compute,
         "cuda_detected": cuda_ok,
         "cuda13_conflict": cuda13_warning,
+        "gpu": gpu,
+        "subtitle_mode": _subtitle_mode(),
+        "pipeline": pipeline,
+        "alignment": alignment,
+        "batch_size": _resolve_batch_size(device),
         "hint": hint,
     }
-
 
 def _has_incompatible_cuda13() -> bool:
     """Detecta si el usuario instalo CUDA Toolkit 13.x a nivel sistema, lo cual
@@ -151,17 +264,7 @@ def _resolve_device(requested: str) -> str:
 def _cuda_available() -> bool:
     try:
         import ctranslate2  # type: ignore
-        if ctranslate2.get_cuda_device_count() <= 0:
-            return False
-        # Verificar cublas64 que es la libreria que falla mas seguido
-        import ctypes
-        for dll in ("cublas64_12.dll", "cublas64_11.dll", "cudnn_ops_infer64_8.dll"):
-            try:
-                ctypes.CDLL(dll)
-                return True
-            except (OSError, AttributeError):
-                continue
-        return False
+        return ctranslate2.get_cuda_device_count() > 0
     except Exception:
         return False
 
@@ -202,8 +305,20 @@ def _stable_ts_available() -> bool:
     except Exception:
         return False
 
+
+def _stable_ts_enabled() -> bool:
+    if _subtitle_mode() in {"fast", "faster-whisper", "raw"}:
+        return False
+    return _stable_ts_available()
+
 def _whisperx_available() -> bool:
+    if os.getenv("WORKFAST_ENABLE_WHISPERX") != "1":
+        return False
     try:
+        import torch  # type: ignore
+        if not torch.cuda.is_available():
+            LOGGER.debug("WhisperX disponible, pero Torch no tiene CUDA; usando faster-whisper.")
+            return False
         import whisperx  # type: ignore # noqa: F401
         return True
     except Exception:
@@ -266,10 +381,10 @@ def _transcribe_with_whisperx(
     progress_callback: Optional[ProgressCallback],
 ) -> tuple[list[Word], str]:
     import whisperx # type: ignore
-    
+
     if progress_callback:
         progress_callback(4, f"Cargando WhisperX {model_name} ({device})")
-        
+
     try:
         model = whisperx.load_model(model_name, device, compute_type=compute_type)
     except Exception as exc:
@@ -277,25 +392,25 @@ def _transcribe_with_whisperx(
         device = "cpu"
         compute_type = "int8"
         model = whisperx.load_model(model_name, device, compute_type=compute_type)
-        
+
     if progress_callback:
         progress_callback(6, "Transcribiendo audio (WhisperX)")
-        
+
     audio = whisperx.load_audio(str(audio_path))
     # whisperx doesnt take all the same kwargs directly, so clean up transcribe_kwargs if needed
     batch_size = 16 if device == "cuda" else 4
     result = model.transcribe(audio, batch_size=batch_size, language=transcribe_kwargs.get("language"))
     detected_language = result["language"]
-    
+
     if progress_callback:
         progress_callback(8, "Alineando subtitulos (WhisperX)")
-        
+
     try:
         model_a, metadata = whisperx.load_align_model(language_code=detected_language, device=device)
         result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
     except Exception as exc:
         LOGGER.warning("WhisperX align fallo: %s", exc)
-        
+
     words: list[Word] = []
     for segment in result["segments"]:
         for w in segment.get("words", []):
@@ -305,7 +420,7 @@ def _transcribe_with_whisperx(
             start = w.get("start", segment.get("start", 0.0))
             end = w.get("end", segment.get("end", start + 0.2))
             words.append(Word(text=text, start=start, end=end))
-            
+
     if not words:
         raise TranscriberError("No detecte voz en el audio.")
     return words, detected_language
@@ -366,23 +481,38 @@ def _transcribe_with_faster_whisper(
     progress_callback: Optional[ProgressCallback],
 ) -> tuple[list[Word], str]:
     try:
-        from faster_whisper import WhisperModel  # type: ignore
+        from faster_whisper import BatchedInferencePipeline, WhisperModel  # type: ignore
     except Exception as exc:  # pragma: no cover - import-time
         raise TranscriberError(
             "Falta instalar faster-whisper. Cierra y vuelve a abrir Workfast para que start.bat instale dependencias."
         ) from exc
 
+    active_device = device
+    active_compute_type = compute_type
     try:
         model = WhisperModel(model_name, device=device, compute_type=compute_type)
     except Exception as exc:
         LOGGER.warning("Whisper init fallo (%s, %s): %s. Fallback a CPU.",
                        device, compute_type, exc)
-        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        active_device = "cpu"
+        active_compute_type = "int8"
+        model = WhisperModel(model_name, device=active_device, compute_type=active_compute_type)
 
     if progress_callback:
-        progress_callback(6, "Transcribiendo audio")
+        if _use_batched_pipeline(active_device):
+            progress_callback(6, f"Transcribiendo audio (batch {_resolve_batch_size(active_device)})")
+        else:
+            progress_callback(6, "Transcribiendo audio")
 
-    segments_iter, info = model.transcribe(str(audio_path), **transcribe_kwargs)
+    if _use_batched_pipeline(active_device):
+        batched_model = BatchedInferencePipeline(model=model)
+        segments_iter, info = batched_model.transcribe(
+            str(audio_path),
+            batch_size=_resolve_batch_size(active_device),
+            **transcribe_kwargs,
+        )
+    else:
+        segments_iter, info = model.transcribe(str(audio_path), **transcribe_kwargs)
     detected_language = (info.language or "en").lower()
 
     words: list[Word] = []
@@ -408,8 +538,14 @@ def _transcribe_with_faster_whisper(
 
 def _video_signature(input_video: Path) -> str:
     stat = input_video.stat()
-    # v2: nuevo VAD + tightening de word ends. Romper cache viejo.
-    raw = f"v2|{input_video.resolve()}|{stat.st_size}|{int(stat.st_mtime)}"
+    if _whisperx_available():
+        aligner = "whisperx"
+    elif _stable_ts_enabled():
+        aligner = "stable-ts"
+    else:
+        aligner = "faster-whisper"
+    # v4: incluye alineador para evitar reutilizar cache con timestamps viejos.
+    raw = f"v4|{aligner}|{input_video.resolve()}|{stat.st_size}|{int(stat.st_mtime)}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -466,11 +602,12 @@ def transcribe_words(
     extract_audio(input_video, audio_path)
 
     device = _resolve_device(DEFAULT_DEVICE)
+    model_name = _resolve_model(model_name, device)
     compute_type = _resolve_compute_type(device, DEFAULT_COMPUTE)
 
     use_whisperx = _whisperx_available()
-    use_stable_ts = _stable_ts_available() and not use_whisperx
-    
+    use_stable_ts = _stable_ts_enabled() and not use_whisperx
+
     if progress_callback and not use_whisperx:
         backend = "stable-ts" if use_stable_ts else "faster-whisper"
         progress_callback(4, f"Cargando modelo {backend} {model_name} ({device})")
@@ -478,12 +615,12 @@ def transcribe_words(
     transcribe_kwargs: dict = {
         "word_timestamps": True,
         "vad_filter": True,
-        # VAD mas estricto: pausas de 250ms y minimos 200ms de habla.
-        # Reduce el "overshoot" tipico de Whisper en finales de palabra.
+        # VAD rapido: menos padding para que palabras en ingles veloz no
+        # arranquen tarde ni hereden silencios largos.
         "vad_parameters": dict(
-            min_silence_duration_ms=250,
-            speech_pad_ms=80,
-            min_speech_duration_ms=200,
+            min_silence_duration_ms=180,
+            speech_pad_ms=40,
+            min_speech_duration_ms=120,
         ),
         "beam_size": 5,
         # Evita que el modelo arrastre contexto erroneo (mejora alineacion temporal).
@@ -537,7 +674,14 @@ def translate_words(
     if not words or source_language == target_language:
         return list(words)
 
-    phrases = group_words_into_phrases(words)
+    phrases = group_words_into_phrases(
+        words,
+        max_words=6,
+        max_chars=48,
+        max_duration=2.6,
+        pause_split=0.55,
+        lead_seconds=0.0,
+    )
     if not phrases:
         return list(words)
 
@@ -634,6 +778,7 @@ def generate_subtitles(
     font_name: str = "Montserrat Black",
     font_size: int = 84,
     margin_v: int = 520,
+    subtitle_offset_ms: float = 0.0,
 ) -> Path:
     """End-to-end: video -> word timestamps -> (optional translation) -> .ass file."""
     words, source_language = transcribe_words(
@@ -653,7 +798,10 @@ def generate_subtitles(
     if progress_callback:
         progress_callback(14, "Renderizando archivo ASS")
 
-    phrases = group_words_into_phrases(words)
+    phrases = group_words_into_phrases(
+        words,
+        manual_offset_seconds=max(-750.0, min(750.0, float(subtitle_offset_ms))) / 1000.0,
+    )
     ass_text = build_ass(
         phrases,
         font_name=font_name,

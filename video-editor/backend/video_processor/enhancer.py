@@ -6,17 +6,18 @@ Usa los binarios ncnn-vulkan oficiales que corren en CUALQUIER GPU via Vulkan
 
 API publica:
   enhance_video(input_video, output_video, target_w, target_h, ...) -> Path
-    - Detecta automaticamente si el video es <1080p y aplica upscale 2x/4x
-      con Real-ESRGAN si hace falta.
-    - Si fps < 60, interpola con RIFE a 60fps (movimiento suave real,
-      no duplicacion de frames).
+    - En modo balanced aplica upscale solo si la fuente es realmente pequena.
+    - En modo ultra puede aplicar Real-ESRGAN y RIFE a 60fps.
     - Devuelve la ruta al video mejorado (o el mismo input si no hizo falta).
 """
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
+import tempfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -30,7 +31,7 @@ TOOLS_DIR = Path(__file__).resolve().parents[2] / "assets" / "tools"
 
 REAL_ESRGAN_DIR_NAME = "realesrgan-ncnn-vulkan-20220424"
 REAL_ESRGAN_ZIP_URL = (
-    "https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan/releases/download/v0.2.0/"
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
     "realesrgan-ncnn-vulkan-20220424-windows.zip"
 )
 
@@ -43,6 +44,84 @@ RIFE_ZIP_URL = (
 
 class EnhancerError(RuntimeError):
     """Raised when enhancement cannot proceed (download failed, GPU missing, etc.)."""
+
+
+def _ncnn_gpu_args() -> list[str]:
+    """Force the discrete GPU by default; set WORKFAST_ENHANCER_GPU=auto to let ncnn choose."""
+    gpu_id = os.getenv("WORKFAST_ENHANCER_GPU", "0").strip()
+    if not gpu_id or gpu_id.lower() == "auto":
+        return []
+    return ["-g", gpu_id]
+
+
+def normalize_enhancer_profile(profile: str | None = None) -> str:
+    """Return the enhancement profile used by the queue.
+
+    balanced is intentionally conservative: it keeps the RTX available for
+    Whisper/NVENC and avoids RIFE unless the user explicitly chooses ultra.
+    """
+    raw = (profile or os.getenv("WORKFAST_ENHANCER_PROFILE") or "balanced").strip().lower()
+    aliases = {
+        "auto": "balanced",
+        "smart": "balanced",
+        "normal": "balanced",
+        "inteligente": "balanced",
+        "pro": "ultra",
+        "quality": "ultra",
+        "calidad": "ultra",
+        "rapido": "fast",
+        "speed": "fast",
+        "off": "fast",
+        "none": "fast",
+    }
+    raw = aliases.get(raw, raw)
+    return raw if raw in {"fast", "balanced", "ultra"} else "balanced"
+
+
+def _ncnn_jobs_args(profile: str | None = None) -> list[str]:
+    """ncnn load:process:save workers.
+
+    The previous 2:4:2 default could pin the RTX at 100% for minutes. Balanced
+    mode leaves thermal headroom; ultra can still be pushed through .env.
+    """
+    configured = os.getenv("WORKFAST_NCNN_JOBS", "").strip()
+    if configured:
+        return ["-j", configured]
+    jobs = "2:4:2" if normalize_enhancer_profile(profile) == "ultra" else "1:2:1"
+    return ["-j", jobs] if jobs else []
+
+
+def _has_encoder(name: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and name in result.stdout
+
+
+def _intermediate_video_encoder_args() -> list[str]:
+    """Fast high-quality intermediate encode; final export still controls delivery settings."""
+    if os.getenv("WORKFAST_FORCE_CPU") != "1" and _has_encoder("h264_nvenc"):
+        return [
+            "-c:v", "h264_nvenc",
+            "-preset", "p7",
+            "-tune", "hq",
+            "-rc", "vbr",
+            "-cq", "15",
+            "-b:v", "0",
+            "-spatial-aq", "1",
+            "-temporal-aq", "1",
+            "-aq-strength", "8",
+            "-pix_fmt", "yuv420p",
+        ]
+    return ["-c:v", "libx264", "-preset", "medium", "-crf", "14", "-pix_fmt", "yuv420p"]
 
 
 def _download_and_extract(url: str, dest_dir: Path, progress_callback: Optional[ProgressCallback]) -> Path:
@@ -72,6 +151,9 @@ def _download_and_extract(url: str, dest_dir: Path, progress_callback: Optional[
         candidates = [p for p in dest_dir.parent.iterdir() if p.is_dir() and p.name.startswith(dest_dir.name.split("-")[0])]
         if candidates:
             return candidates[0]
+        direct_exe = next(dest_dir.parent.glob(f"{dest_dir.name.split('-')[0]}*.exe"), None)
+        if direct_exe:
+            return dest_dir.parent
         raise EnhancerError(f"Extraccion exitosa pero no encuentro {dest_dir}")
     return dest_dir
 
@@ -82,6 +164,9 @@ def ensure_realesrgan(progress_callback: Optional[ProgressCallback] = None) -> P
     binary = install_dir / "realesrgan-ncnn-vulkan.exe"
     if binary.exists():
         return binary
+    direct_binary = TOOLS_DIR / "realesrgan-ncnn-vulkan.exe"
+    if direct_binary.exists():
+        return direct_binary
     install_dir = _download_and_extract(REAL_ESRGAN_ZIP_URL, install_dir, progress_callback)
     binary = install_dir / "realesrgan-ncnn-vulkan.exe"
     if not binary.exists():
@@ -94,6 +179,9 @@ def ensure_rife(progress_callback: Optional[ProgressCallback] = None) -> Path:
     binary = install_dir / "rife-ncnn-vulkan.exe"
     if binary.exists():
         return binary
+    direct_binary = TOOLS_DIR / "rife-ncnn-vulkan.exe"
+    if direct_binary.exists():
+        return direct_binary
     install_dir = _download_and_extract(RIFE_ZIP_URL, install_dir, progress_callback)
     binary = install_dir / "rife-ncnn-vulkan.exe"
     if not binary.exists():
@@ -101,8 +189,8 @@ def ensure_rife(progress_callback: Optional[ProgressCallback] = None) -> Path:
     return binary
 
 
-def _probe_resolution_and_fps(video: Path) -> tuple[int, int, float]:
-    """Devuelve (width, height, fps) usando ffprobe."""
+def _probe_video(video: Path) -> tuple[int, int, float, float]:
+    """Devuelve (width, height, fps, duration_seconds) usando ffprobe."""
     cmd = [
         "ffprobe",
         "-v",
@@ -110,7 +198,7 @@ def _probe_resolution_and_fps(video: Path) -> tuple[int, int, float]:
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height,r_frame_rate,avg_frame_rate",
+        "stream=width,height,r_frame_rate,avg_frame_rate,duration:format=duration",
         "-of",
         "default=nw=1",
         str(video),
@@ -120,6 +208,7 @@ def _probe_resolution_and_fps(video: Path) -> tuple[int, int, float]:
         raise EnhancerError(f"ffprobe fallo: {result.stderr}")
     width = height = 0
     fps = 30.0
+    duration = 0.0
     for line in result.stdout.splitlines():
         if "=" not in line:
             continue
@@ -138,14 +227,91 @@ def _probe_resolution_and_fps(video: Path) -> tuple[int, int, float]:
                     fps = num_f / den_f
             except ValueError:
                 pass
+        elif key == "duration":
+            try:
+                parsed = float(val)
+                if parsed > duration:
+                    duration = parsed
+            except ValueError:
+                pass
+    return width, height, fps, duration
+
+
+def _probe_resolution_and_fps(video: Path) -> tuple[int, int, float]:
+    """Devuelve (width, height, fps) usando ffprobe."""
+    width, height, fps, _duration = _probe_video(video)
     return width, height, fps
 
 
-def _run(cmd: list[str], desc: str) -> None:
+def _count_frames(folder: Path) -> int:
+    try:
+        return sum(1 for _ in folder.glob("*.png"))
+    except OSError:
+        return 0
+
+
+def _run(
+    cmd: list[str],
+    desc: str,
+    *,
+    progress_callback: Optional[ProgressCallback] = None,
+    progress_start: int = 0,
+    progress_end: int = 0,
+    progress_step: str | None = None,
+    frame_dir: Path | None = None,
+    expected_frames: int = 0,
+) -> None:
     LOGGER.info("[%s] %s", desc, " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if result.returncode != 0:
-        raise EnhancerError(f"{desc} fallo: {result.stderr.strip()[:500]}")
+    if not progress_callback or not frame_dir or expected_frames <= 0 or progress_end <= progress_start:
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if result.returncode != 0:
+            raise EnhancerError(f"{desc} fallo: {result.stderr.strip()[:500]}")
+        return
+
+    step = progress_step or desc
+    last_percent = progress_start - 1
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as log_file:
+        process = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        while process.poll() is None:
+            produced = _count_frames(frame_dir)
+            ratio = max(0.0, min(1.0, produced / max(expected_frames, 1)))
+            percent = progress_start + int(ratio * (progress_end - progress_start))
+            if percent > last_percent:
+                progress_callback(percent, f"{step} ({produced}/{expected_frames})")
+                last_percent = percent
+            time.sleep(1.0)
+
+        return_code = process.wait()
+        produced = _count_frames(frame_dir)
+        if return_code == 0:
+            progress_callback(progress_end, f"{step} ({produced}/{expected_frames})")
+            return
+
+        log_file.seek(0)
+        log_tail = log_file.read().strip()[-1200:]
+        raise EnhancerError(f"{desc} fallo: {log_tail}")
+
+
+def _map_progress(
+    callback: Optional[ProgressCallback],
+    start: int,
+    end: int,
+) -> Optional[ProgressCallback]:
+    if callback is None:
+        return None
+
+    def mapped(progress: int, step: str) -> None:
+        clamped = max(0, min(100, int(progress)))
+        callback(start + int((clamped / 100.0) * (end - start)), step)
+
+    return mapped
 
 
 def upscale_with_realesrgan(
@@ -154,6 +320,7 @@ def upscale_with_realesrgan(
     *,
     scale: int = 4,
     model: str = "realesrgan-x4plus",
+    ncnn_profile: str | None = None,
     binary: Optional[Path] = None,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> Path:
@@ -180,10 +347,11 @@ def upscale_with_realesrgan(
 
     try:
         # 1. Detectar fps original para reensamblar
-        _, _, fps = _probe_resolution_and_fps(input_video)
+        _, _, fps, duration = _probe_video(input_video)
+        expected_frames = max(1, int(round(duration * fps))) if duration > 0 else 0
 
         if progress_callback:
-            progress_callback(0, "Extrayendo frames para upscale IA")
+            progress_callback(2, "Extrayendo frames para upscale IA")
         _run(
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -192,10 +360,19 @@ def upscale_with_realesrgan(
                 str(frames_in / "%08d.png"),
             ],
             "extract frames",
+            progress_callback=progress_callback,
+            progress_start=3,
+            progress_end=14,
+            progress_step="Extrayendo frames para upscale IA",
+            frame_dir=frames_in,
+            expected_frames=expected_frames,
         )
+        n_input = _count_frames(frames_in)
+        if n_input <= 0:
+            raise EnhancerError("No se extrajeron frames para Real-ESRGAN.")
 
         if progress_callback:
-            progress_callback(0, f"Upscale IA {scale}x con Real-ESRGAN")
+            progress_callback(15, f"Upscale IA {scale}x con Real-ESRGAN")
         # Real-ESRGAN procesa carpeta entera con paralelismo interno (ncnn batch).
         _run(
             [
@@ -205,12 +382,20 @@ def upscale_with_realesrgan(
                 "-n", model,
                 "-s", str(scale),
                 "-f", "png",
+                *_ncnn_gpu_args(),
+                *_ncnn_jobs_args(ncnn_profile),
             ],
             "realesrgan",
+            progress_callback=progress_callback,
+            progress_start=16,
+            progress_end=82,
+            progress_step=f"Upscale IA {scale}x con Real-ESRGAN",
+            frame_dir=frames_out,
+            expected_frames=n_input,
         )
 
         if progress_callback:
-            progress_callback(0, "Reensamblando video upscaleado")
+            progress_callback(86, "Reensamblando video upscaleado")
         # Reensambla con audio del original
         _run(
             [
@@ -219,14 +404,16 @@ def upscale_with_realesrgan(
                 "-i", str(frames_out / "%08d.png"),
                 "-i", str(input_video),
                 "-map", "0:v:0", "-map", "1:a?",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "14",
-                "-pix_fmt", "yuv420p",
+                *_intermediate_video_encoder_args(),
                 "-c:a", "copy",
                 "-shortest",
+                "-movflags", "+faststart",
                 str(output_video),
             ],
             "reassemble",
         )
+        if progress_callback:
+            progress_callback(100, "Upscale IA listo")
         return output_video
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -237,6 +424,7 @@ def interpolate_to_60fps_with_rife(
     output_video: Path,
     *,
     target_fps: int = 60,
+    ncnn_profile: str | None = None,
     binary: Optional[Path] = None,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> Path:
@@ -248,10 +436,12 @@ def interpolate_to_60fps_with_rife(
     if binary is None:
         binary = ensure_rife(progress_callback)
 
-    width, height, src_fps = _probe_resolution_and_fps(input_video)
+    width, height, src_fps, duration = _probe_video(input_video)
     if src_fps >= target_fps - 0.5:
         # Ya esta a 60+ fps o por encima
         shutil.copy2(input_video, output_video)
+        if progress_callback:
+            progress_callback(100, "Video ya esta a 60fps")
         return output_video
 
     # Cuantos frames necesitamos por cada par original
@@ -266,8 +456,9 @@ def interpolate_to_60fps_with_rife(
     frames_out.mkdir(parents=True, exist_ok=True)
 
     try:
+        expected_frames = max(1, int(round(duration * src_fps))) if duration > 0 else 0
         if progress_callback:
-            progress_callback(0, "Extrayendo frames para RIFE")
+            progress_callback(2, "Extrayendo frames para RIFE")
         _run(
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -276,13 +467,21 @@ def interpolate_to_60fps_with_rife(
                 str(frames_in / "%08d.png"),
             ],
             "extract frames rife",
+            progress_callback=progress_callback,
+            progress_start=3,
+            progress_end=14,
+            progress_step="Extrayendo frames para RIFE",
+            frame_dir=frames_in,
+            expected_frames=expected_frames,
         )
 
-        n_input = len(list(frames_in.glob("*.png")))
+        n_input = _count_frames(frames_in)
+        if n_input <= 0:
+            raise EnhancerError("No se extrajeron frames para RIFE.")
         n_output = n_input * multiplier
 
         if progress_callback:
-            progress_callback(0, f"Interpolando IA {src_fps:.0f}->{target_fps}fps con RIFE")
+            progress_callback(15, f"Interpolando IA {src_fps:.0f}->{target_fps}fps con RIFE")
         _run(
             [
                 str(binary),
@@ -291,12 +490,20 @@ def interpolate_to_60fps_with_rife(
                 "-n", str(n_output),
                 "-m", "rife-v4.6",  # modelo balanced
                 "-f", "%08d.png",
+                *_ncnn_gpu_args(),
+                *_ncnn_jobs_args(ncnn_profile),
             ],
             "rife interpolate",
+            progress_callback=progress_callback,
+            progress_start=16,
+            progress_end=84,
+            progress_step=f"Interpolando IA {src_fps:.0f}->{target_fps}fps con RIFE",
+            frame_dir=frames_out,
+            expected_frames=n_output,
         )
 
         if progress_callback:
-            progress_callback(0, "Reensamblando 60fps")
+            progress_callback(88, "Reensamblando 60fps")
         _run(
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -304,14 +511,16 @@ def interpolate_to_60fps_with_rife(
                 "-i", str(frames_out / "%08d.png"),
                 "-i", str(input_video),
                 "-map", "0:v:0", "-map", "1:a?",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "14",
-                "-pix_fmt", "yuv420p",
+                *_intermediate_video_encoder_args(),
                 "-c:a", "copy",
                 "-shortest",
+                "-movflags", "+faststart",
                 str(output_video),
             ],
             "reassemble rife",
         )
+        if progress_callback:
+            progress_callback(100, "Interpolacion IA lista")
         return output_video
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -370,48 +579,60 @@ def enhance_video(
     do_upscale: bool = True,
     do_interpolate: bool = True,
     model: str = "realesrgan-x4plus",
+    profile: str | None = None,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> Path:
-    """Pipeline completo de mejora IA. Solo aplica cuando hay win REAL.
+    """Pipeline completo de mejora IA.
 
-    Reglas honestas (no forzar mejoras que se vean peor):
-      - <720p (480p, 360p):           4x upscale (gran win, fuente low-res)
-      - 720p:                         4x upscale (win claro, downsize a 1080p preserva detalle)
-      - 1080p comprimido (<3 Mbps):   2x detail pass (recupera detalle perdido por compresion)
-      - 1080p limpio (>=3 Mbps):      SKIP (ya esta nitido, IA agrega artefactos)
-      - >=1440p:                      SKIP (mejor que 1080p ya, IA solo lo empeora)
-
-    fps:
-      - <60fps:  RIFE 60fps (movimiento suave real)
-      - >=60fps: SKIP
+    Perfiles:
+      - fast: no corre redes neuronales de video; el render final igual usa
+        NVENC, escalado Lanczos y filtros de nitidez.
+      - balanced: default para cola. Omite redes neuronales de video para no
+        clavar la RTX; el render final aplica Lanczos/NVENC/nitidez.
+      - ultra: modo antiguo/profundo. Usa Real-ESRGAN/RIFE cuando aplica.
     """
-    width, height, fps = _probe_resolution_and_fps(input_video)
+    profile = normalize_enhancer_profile(profile)
+    width, height, fps, duration = _probe_video(input_video)
     bitrate_kbps = _estimate_bitrate_kbps(input_video)
-    LOGGER.info("Source: %dx%d @ %.2f fps, bitrate ~%.0f kbps",
-                width, height, fps, bitrate_kbps)
+    short_edge = min(width, height)
+    LOGGER.info(
+        "Source: %dx%d @ %.2f fps, %.1fs, bitrate ~%.0f kbps, enhancer=%s",
+        width, height, fps, duration, bitrate_kbps, profile,
+    )
 
-    # Decidir scale honestamente
-    if height < 720:
+    if profile in {"fast", "balanced"}:
+        label = "rapido" if profile == "fast" else "inteligente"
+        if progress_callback:
+            progress_callback(100, f"Modo {label}: IA pesada de video omitida")
+        if input_video != output_video:
+            shutil.copy2(input_video, output_video)
+        return output_video
+
+    # Decidir scale honestamente por el borde corto. En vertical, 720x1280 es
+    # 720p aunque height sea 1280; usar solo height haria trabajar de mas.
+    if short_edge < 540:
         scale = 4
-        reason = f"low-res ({height}p)"
-    elif height < 1000:
-        scale = 4
-        reason = f"720p->4K detail boost"
-    elif height < 1300 and bitrate_kbps > 0 and bitrate_kbps < 3500:
+        reason = f"muy baja resolucion ({width}x{height})"
+    elif short_edge < 900:
+        scale = 2
+        reason = f"fuente 720p/vertical ({width}x{height})"
+    elif short_edge < 1300 and bitrate_kbps > 0 and bitrate_kbps < 3500:
         scale = 2
         reason = f"1080p comprimido ({bitrate_kbps:.0f} kbps)"
     else:
         scale = 0
-        reason = (f"ya esta nitido ({height}p, {bitrate_kbps:.0f} kbps) - "
-                  f"IA aqui agregaria artefactos")
+        reason = (
+            f"ya esta nitido ({width}x{height}, {bitrate_kbps:.0f} kbps) - "
+            "IA aqui agregaria artefactos"
+        )
+    needs_interp = do_interpolate and fps < target_fps - 0.5
 
     needs_upscale = do_upscale and scale > 0
-    needs_interp = do_interpolate and fps < target_fps - 0.5
 
     if not needs_upscale and not needs_interp:
         LOGGER.info("Skip enhance: %s; fps=%.1f", reason, fps)
         if progress_callback:
-            progress_callback(0, "Video ya en buena calidad, IA omitida (no la fuerzo)")
+            progress_callback(100, f"IA de video omitida: {reason}")
         if input_video != output_video:
             shutil.copy2(input_video, output_video)
         return output_video
@@ -429,7 +650,12 @@ def enhance_video(
             current, target,
             scale=scale,
             model=model,
-            progress_callback=progress_callback,
+            ncnn_profile=profile,
+            progress_callback=_map_progress(
+                progress_callback,
+                3,
+                47 if needs_interp else 92,
+            ),
         )
         current = target
         LOGGER.info("Real-ESRGAN OK -> %s", target)
@@ -440,9 +666,12 @@ def enhance_video(
         interpolate_to_60fps_with_rife(
             current, output_video,
             target_fps=target_fps,
-            progress_callback=progress_callback,
+            ncnn_profile=profile,
+            progress_callback=_map_progress(progress_callback, 48 if needs_upscale else 3, 92),
         )
         if work_intermediate.exists():
             work_intermediate.unlink(missing_ok=True)
 
+    if progress_callback:
+        progress_callback(100, "Mejora IA lista")
     return output_video

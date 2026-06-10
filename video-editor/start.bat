@@ -11,11 +11,14 @@ echo ============================================
 echo.
 
 :: --- 1. Cerrar servidores Python anteriores en el puerto 5000 ---
-echo [1/5] Cerrando servidores anteriores y limpiando cache...
+echo [1/5] Cerrando servidores anteriores y procesos zombis...
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr :5000 ^| findstr LISTENING 2^>nul') do (
-    echo   - Cerrando PID %%a
+    echo   - Liberando puerto 5000 (PID %%a)
     taskkill /f /pid %%a >nul 2>nul
 )
+echo   - Limpiando procesos en segundo plano...
+wmic process where "ExecutablePath like '%%video-editor\\\\venv%%'" call terminate >nul 2>nul
+wmic process where "CommandLine like '%%--remote-debugging-port=9222%%'" call terminate >nul 2>nul
 timeout /t 1 /nobreak >nul
 
 :: Borrar __pycache__ para forzar recompilacion (evita errores fantasma de versiones viejas)
@@ -26,13 +29,19 @@ if exist "backend\video_processor\__pycache__" rmdir /s /q "backend\video_proces
 echo [2/5] Verificando Python...
 where py >nul 2>nul
 if not errorlevel 1 (
-    py -3.10 -V >nul 2>nul
+    py -3.11 -V >nul 2>nul
     if not errorlevel 1 (
-        set "PYTHON_BASE=py -3.10"
-        echo   Usando Python 3.10 via launcher.
+        set "PYTHON_BASE=py -3.11"
+        echo   Usando Python 3.11 via launcher.
     ) else (
-        set "PYTHON_BASE=python"
-        echo   Python 3.10 no encontrado via launcher, usando predeterminado.
+        py -3.10 -V >nul 2>nul
+        if not errorlevel 1 (
+            set "PYTHON_BASE=py -3.10"
+            echo   Usando Python 3.10 via launcher.
+        ) else (
+            set "PYTHON_BASE=python"
+            echo   Python 3.11/3.10 no encontrado via launcher, usando predeterminado.
+        )
     )
 ) else (
     set "PYTHON_BASE=python"
@@ -48,21 +57,47 @@ if not errorlevel 1 (
     )
 )
 
+%PYTHON_BASE% -V >nul 2>nul
+if errorlevel 1 (
+    echo.
+    echo ERROR: Python aparece en PATH pero no arranca bien.
+    echo En esta PC suele pasar cuando Windows usa el acceso directo de Microsoft Store.
+    echo Instala Python 3.10 o 3.11 desde https://www.python.org/downloads/
+    echo y marca "Add Python to PATH" durante la instalacion.
+    echo.
+    pause
+    exit /b 1
+)
+
 :: --- 3. Verificar FFmpeg ---
 echo [3/5] Verificando FFmpeg...
 where ffmpeg >nul 2>nul
 if errorlevel 1 (
-    echo.
-    echo ERROR: FFmpeg no esta instalado o no esta en PATH.
-    pause
-    exit /b 1
+    :: No esta en PATH global. Si el instalador dejo ffmpeg bundleado en la
+    :: carpeta del programa, lo agregamos a PATH solo para esta sesion.
+    if exist "ffmpeg\ffmpeg.exe" (
+        echo   - Usando FFmpeg bundleado ^(carpeta ffmpeg\^)
+        set "PATH=%CD%\ffmpeg;%PATH%"
+    ) else (
+        echo.
+        echo ERROR: FFmpeg no esta instalado o no esta en PATH.
+        echo Descarga desde https://www.gyan.dev/ffmpeg/builds/
+        echo.
+        pause
+        exit /b 1
+    )
 )
 where ffprobe >nul 2>nul
 if errorlevel 1 (
-    echo.
-    echo ERROR: ffprobe no esta instalado o no esta en PATH.
-    pause
-    exit /b 1
+    if exist "ffmpeg\ffprobe.exe" (
+        :: ffmpeg.exe encontrado pero no ffprobe en PATH - usar el bundle
+        set "PATH=%CD%\ffmpeg;%PATH%"
+    ) else (
+        echo.
+        echo ERROR: ffprobe no esta instalado o no esta en PATH.
+        pause
+        exit /b 1
+    )
 )
 
 :: --- 4. Preparar entorno virtual ---
@@ -75,6 +110,20 @@ if not exist "venv\Scripts\python.exe" (
         echo ERROR: No se pudo crear el entorno virtual.
         pause
         exit /b 1
+    )
+) else (
+    "venv\Scripts\python.exe" -V >nul 2>nul
+    if errorlevel 1 (
+        echo   Entorno virtual roto o copiado desde otra PC. Recreando venv...
+        rmdir /s /q venv >nul 2>nul
+        %PYTHON_BASE% -m venv venv
+        if errorlevel 1 (
+            echo.
+            echo ERROR: No se pudo recrear el entorno virtual.
+            echo Instala Python 3.10/3.11 real desde python.org y marca Add Python to PATH.
+            pause
+            exit /b 1
+        )
     )
 )
 
@@ -89,7 +138,7 @@ if exist ".env" (
 )
 
 echo   Verificando dependencias...
-"%PYTHON_EXE%" -c "import flask, flask_cors, yt_dlp, faster_whisper, deep_translator, whisperx, df" >nul 2>nul
+"%PYTHON_EXE%" -c "import flask, flask_cors, yt_dlp, faster_whisper, ctranslate2, deep_translator, df, soundfile, pedalboard, parselmouth, PIL" >nul 2>nul
 if errorlevel 1 (
     echo.
     echo   Faltan dependencias. Instalando ^(2-5 min la primera vez^)...
@@ -112,42 +161,17 @@ if errorlevel 1 (
     echo   Dependencias instaladas.
 )
 
-:: --- 5. Arrancar servidor en su propia ventana ---
-echo [5/5] Arrancando servidor...
-echo.
-echo Se abrira una ventana llamada "Evse Server".
-echo Para apagar Evse: cierra esa ventana.
+:: --- 5. Abrir ventana nativa con la app (cierra el server al cerrar) ---
+echo [5/5] Abriendo Evse Video Studio...
 echo.
 
-:: Lanzar el worker en una ventana NUEVA. El worker se encarga del Python.
-start "Evse Server" "%CD%\_run_server.bat"
-
-:: Esperar a que el server responda
-echo Esperando a que el servidor arranque...
-set /a tries=0
-:waitloop
-set /a tries+=1
-timeout /t 1 /nobreak >nul
-powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:5000/api/health' -TimeoutSec 2; if ($r.StatusCode -eq 200) { exit 0 } } catch { exit 1 }; exit 1" >nul 2>nul
-if not errorlevel 1 goto :ready
-if !tries! lss 25 goto :waitloop
-
-echo.
-echo ============================================
-echo ADVERTENCIA: El servidor no respondio.
-echo ============================================
-echo.
-echo Revisa la ventana "Evse Server" para ver el error.
-echo Si dice algo como "ModuleNotFoundError" o similar,
-echo borra la carpeta venv y vuelve a abrir este archivo.
-echo.
-pause
-exit /b 1
-
-:ready
-echo.
-echo Servidor listo en http://127.0.0.1:5000
-echo Abriendo navegador...
-start "" "http://127.0.0.1:5000"
-timeout /t 2 /nobreak >nul
-exit /b 0
+:: launcher_window.py:
+::   - levanta el server Flask como subproceso sin ventana (log a evse_server.log)
+::   - espera /api/health
+::   - abre ventana nativa WebView2 (pywebview). Si WebView2 no esta, cae a navegador.
+::   - al cerrar la ventana, mata el server.
+::
+:: Bloquea esta CMD hasta que el usuario cierre la ventana. Si Evse.vbs
+:: la lanzo oculta, el usuario solo ve la ventana nativa - ni una CMD.
+"%PYTHON_EXE%" -B launcher_window.py
+exit /b %errorlevel%

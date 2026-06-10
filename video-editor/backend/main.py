@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 import json
 import os
@@ -25,14 +26,36 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from yt_dlp import YoutubeDL
 
+
+def _preload_env_file() -> None:
+    """Load .env before importing video/audio processors that read env at import."""
+    base_dir = Path(__file__).resolve().parents[1]
+    for env_path in (base_dir.parent / ".env", base_dir / ".env"):
+        if not env_path.exists():
+            continue
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and not os.getenv(key):
+                os.environ[key] = value
+
+
+_preload_env_file()
+
 from video_processor import (
+    RenderCancelled,
     TranscriberError,
     VideoEditor,
     cleanup_cache,
     generate_subtitles,
 )
-from video_processor.enhancer import enhance_video, EnhancerError
+from video_processor.enhancer import enhance_video, EnhancerError, normalize_enhancer_profile
 from video_processor.transcriber import describe_backend
+from video_processor.audio_enhancer import voice_backend_status
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -45,6 +68,13 @@ YOUTUBE_COOKIES_FILE = LIBRARY_FOLDER / "youtube_cookies.txt"
 FACEBOOK_COOKIES_FILE = LIBRARY_FOLDER / "facebook_cookies.txt"
 YOUTUBE_BROWSER_PROFILE = LIBRARY_FOLDER / "youtube_chrome_profile"
 PROFILES_FILE = LIBRARY_FOLDER / "profiles.json"
+FB_ACCOUNTS_FILE = LIBRARY_FOLDER / "fb_accounts.json"
+FB_QUEUE_FILE = LIBRARY_FOLDER / "fb_queue.json"
+HUNTER_CHANNELS_FILE = LIBRARY_FOLDER / "hunter_channels.json"
+HUNTER_SEED_FILE = LIBRARY_FOLDER / "hunter_seed.json"
+
+# Slots diarios fijos para publicación en Facebook (hora local)
+FB_DAILY_SLOTS = [(9, 0), (13, 0), (19, 0)]
 YOUTUBE_DEBUG_PORT = 9222
 
 ALLOWED_EXTENSIONS = {"mp4", "avi", "mov", "mkv", "png", "jpg", "jpeg", "webp"}
@@ -60,13 +90,19 @@ YOUTUBE_COOKIE_BROWSERS = {
 }
 YOUTUBE_AUTO_COOKIE_SEQUENCE = [None, "file"]
 YOUTUBE_DOWNLOAD_FORMATS = [
-    "bv*[height<=1080][fps<=60][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=1080][fps<=60]+ba/bv*[height<=1080]+ba/b[height<=1080]/best[height<=1080]/best",
-    "bv*+ba/b",
-    "best",
+    # Cada selector exige audio: bv*+ba ya garantiza audio porque "+ba"
+    # falla si no hay audio. Los fallbacks "b" y "best" llevan [acodec!=none]
+    # para evitar quedarse con un stream video-only (problema tipico de Shorts
+    # cuya version HEVC viene sin pista de audio).
+    "bv*[height<=1080][fps<=60][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=1080][fps<=60]+ba/bv*[height<=1080]+ba/b[height<=1080][acodec!=none]/best[height<=1080][acodec!=none]/best[acodec!=none]",
+    "bv*+ba/b[acodec!=none]",
+    "best[acodec!=none]",
     None,
 ]
 
-OUTPUT_LRU_KEEP = 30
+OUTPUT_LRU_KEEP = 500  # Antes 60 -- borraba renders agendados en FB que no
+                       # estaban localmente. Subido a 500 para que un mes de
+                       # programacion (4 vids/dia x 30 dias = 120) no se pierda.
 JOB_RETENTION_SECONDS = 60 * 60 * 12  # keep finished jobs for 12 hours
 
 
@@ -105,6 +141,50 @@ YOUTUBE_BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
 debug_browser_process: subprocess.Popen | None = None
+
+# ── Cancelacion de renders ───────────────────────────────────────────
+# _job_cancel: por job_id, un Event que se setea cuando el usuario cancela.
+# _job_procs: por job_id, los subprocesos FFmpeg activos (para matarlos).
+# El worker y VideoEditor consultan/registran via los helpers de abajo.
+_job_cancel: dict[str, threading.Event] = {}
+_job_procs: dict[str, list] = {}
+_job_proc_lock = threading.Lock()
+
+# Serializa los renders: hasta 2 en paralelo comparten la GPU (NVENC + Whisper).
+# Con RTX 5070 (12GB VRAM) dos sesiones h264_nvenc de 1080p usan ~2-3GB de VRAM
+# en total — caben bien. Si Whisper tambien corre en paralelo puede haber presion
+# pero no fallo. Reducir a 1 con WORKFAST_MAX_PARALLEL_RENDERS=1 en .env si hay
+# problemas de VRAM, o subir a 3 si la GPU es mas grande.
+_MAX_PARALLEL_RENDERS = max(1, int(os.getenv("WORKFAST_MAX_PARALLEL_RENDERS", "2")))
+_RENDER_SEM = threading.BoundedSemaphore(_MAX_PARALLEL_RENDERS)
+
+# Limita descargas de YouTube/TikTok/FB concurrentes. Con muchos videos
+# seleccionados al mismo tiempo, yt-dlp lanza muchos procesos y Flask puede
+# saturarse causando "Failed to fetch" en el cliente. 3 en paralelo es el
+# balance optimo entre velocidad y estabilidad.
+_MAX_PARALLEL_DOWNLOADS = max(1, int(os.getenv("WORKFAST_MAX_PARALLEL_DOWNLOADS", "3")))
+_DOWNLOAD_SEM = threading.BoundedSemaphore(_MAX_PARALLEL_DOWNLOADS)
+
+
+def _register_job_process(job_id: str, proc) -> None:
+    """VideoEditor llama esto cuando arranca un FFmpeg, para poder matarlo."""
+    with _job_proc_lock:
+        _job_procs.setdefault(job_id, []).append(proc)
+
+
+def _job_is_cancelled(job_id: str) -> bool:
+    ev = _job_cancel.get(job_id)
+    return ev is not None and ev.is_set()
+
+
+def _begin_cancellable_job(job_id: str) -> None:
+    _job_cancel[job_id] = threading.Event()
+
+
+def _clear_job_tracking(job_id: str) -> None:
+    with _job_proc_lock:
+        _job_procs.pop(job_id, None)
+    _job_cancel.pop(job_id, None)
 
 
 def allowed_file(filename: str) -> bool:
@@ -177,16 +257,21 @@ def list_library_assets(asset_type: str | None = None) -> dict:
 
 
 def load_profiles() -> dict:
-    if not PROFILES_FILE.exists():
-        return {}
-    try:
-        data = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    for path in (PROFILES_FILE, PROFILES_FILE.with_suffix(".json.bak")):
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data:
+                return data
+        except Exception:
+            continue
+    return {}
 
 
 def save_profiles(profiles: dict) -> None:
+    if PROFILES_FILE.exists():
+        PROFILES_FILE.replace(PROFILES_FILE.with_suffix(".json.bak"))
     PROFILES_FILE.write_text(json.dumps(profiles, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -297,6 +382,37 @@ def cleanup_outputs(keep: int = OUTPUT_LRU_KEEP) -> None:
             pass
 
 
+def cleanup_orphan_uploads() -> int:
+    """Borra basura de uploads/: .part (descargas incompletas de yt-dlp) y .ytdl.
+
+    Retorna numero de archivos borrados. Se ejecuta al arrancar el server.
+    """
+    if not UPLOAD_FOLDER.exists():
+        return 0
+    deleted = 0
+    for path in UPLOAD_FOLDER.iterdir():
+        if not path.is_file():
+            continue
+        name = path.name.lower()
+        if name.endswith(".part") or name.endswith(".ytdl") or ".mp4.part-" in name:
+            try:
+                path.unlink()
+                deleted += 1
+            except Exception:
+                pass
+    return deleted
+
+
+def _delayed_unlink(path: Path, delay: float = 7200.0) -> None:
+    def _worker():
+        time.sleep(delay)
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def reap_old_jobs() -> None:
     cutoff = time.time() - JOB_RETENTION_SECONDS
     with jobs_lock:
@@ -327,9 +443,50 @@ def set_job(job_id: str, **updates) -> None:
         jobs[job_id]["updated_at"] = datetime.utcnow().isoformat() + "Z"
 
 
+def set_job_progress(job_id: str, progress: int, step: str) -> None:
+    """Update render progress without letting parallel phases move it backwards."""
+    with jobs_lock:
+        job = jobs.setdefault(job_id, {})
+        current = int(job.get("progress") or 0)
+        job.update(status="processing", progress=max(current, int(progress)), step=step)
+        job["updated_at"] = datetime.utcnow().isoformat() + "Z"
+
+
 def is_supported_video_url(url: str) -> bool:
     parsed = urlparse(url or "")
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _video_file_has_audio(path: Path) -> bool:
+    """ffprobe rapido para verificar que el video tenga un audio stream con datos.
+
+    No basta con que el container declare un stream de audio; tambien debe
+    tener packets reales. Algunos downloads salen con stream "fantasma".
+    """
+    if not path.exists() or path.stat().st_size < 1024:
+        return False
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type,duration",
+             "-of", "default=noprint_wrappers=1:nokey=0", str(path)],
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
+        )
+        out = result.stdout or ""
+        if "codec_type=audio" not in out:
+            return False
+        # Audio bytes per second sanity check
+        packets = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "packet=size", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        total = sum(int(line) for line in packets.stdout.splitlines() if line.strip().isdigit())
+        # Necesitamos al menos 5KB de datos (audio real -- silencio sintetico
+        # de anullsrc es <100 bytes)
+        return total > 5120
+    except Exception:
+        return False
 
 
 def detect_platform(url: str) -> str:
@@ -373,11 +530,16 @@ def tiktok_download_formats() -> list[str | None]:
     Los siguientes son fallbacks progresivos hasta 'best'.
     """
     return [
-        # Formato sin marca de agua: bytevc1 es el codec nativo de descarga de TikTok
-        "bytevc1[height<=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio",
-        # Fallback: mejor video disponible sin especificar codec
-        "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "best",
+        # PRIORIDAD: streams que TIENEN audio (Tiktok no-watermark a veces es
+        # video-only y los videos llegan mudos). Probamos las versiones con
+        # audio garantizado primero, despues fallbacks.
+        # 1) Mejor combo video+audio que TikTok sirva
+        "bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio",
+        # 2) Streams combinados con audio (el container ya incluye audio)
+        "best[height<=1080][acodec!=none]/best[acodec!=none]",
+        # 3) bytevc1 sin watermark + cualquier audio (si TikTok lo permite)
+        "bytevc1[height<=1080]+bestaudio/bytevc1+bestaudio",
+        # 4) Default de yt-dlp como ultimo recurso
         None,
     ]
 
@@ -412,9 +574,9 @@ def facebook_options(base_options: dict, browser: str | None) -> dict:
 def facebook_download_formats() -> list[str | None]:
     """Formatos de descarga para Facebook en orden de preferencia."""
     return [
-        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "best",
+        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080][acodec!=none]",
+        "bestvideo[height<=720]+bestaudio/best[height<=720][acodec!=none]",
+        "best[acodec!=none]",
         None,
     ]
 
@@ -715,6 +877,9 @@ def normalize_youtube_entry(entry: dict, platform: str = "youtube") -> dict:
         "url": webpage_url,
         "duration": entry.get("duration"),
         "channel": channel,
+        "uploader": entry.get("uploader") or channel,
+        "view_count": entry.get("view_count") or entry.get("play_count") or 0,
+        "upload_date": entry.get("upload_date") or "",
         "thumbnail": thumbnail,
         "platform": platform,
     }
@@ -754,19 +919,37 @@ def capabilities():
     whisper_info = describe_backend()
     nvenc_status = VideoEditor.get_nvenc_status()
     nvenc_ok = nvenc_status["available"]
+    rtx_profile = nvenc_ok and VideoEditor._high_end_nvidia_gpu()
+    voice_info = voice_backend_status()
     return jsonify(
         {
             "success": True,
             "subtitles_local": True,
             "translation_languages": ["es", "en", "pt"],
-            "max_queue": 5,
+            "max_queue": 20,
             "subtitle_engine": "faster-whisper",
             "video_encoder": "h264_nvenc" if nvenc_ok else "libx264",
-            "video_backend_label": "GPU (NVENC)" if nvenc_ok else "CPU (libx264)",
+            "video_backend_label": "GPU RTX (NVENC HQ)" if rtx_profile else ("GPU (NVENC)" if nvenc_ok else "CPU (libx264)"),
             "nvenc": nvenc_status,
             "whisper": whisper_info,
+            "enhancer": {
+                "profile": normalize_enhancer_profile(),
+                "gpu": os.getenv("WORKFAST_ENHANCER_GPU", "0"),
+                "ncnn_jobs": os.getenv("WORKFAST_NCNN_JOBS", "1:2:1"),
+                "rife_balanced": os.getenv("WORKFAST_ENABLE_RIFE_BALANCED", "0") == "1",
+            },
+            "npu": {
+                "used": False,
+                "reason": "Las librerias actuales (FFmpeg, Whisper, Real-ESRGAN/RIFE) no exponen backend NPU estable en Windows.",
+            },
+            "voice": voice_info,
         }
     )
+
+
+@app.get("/api/voice/models")
+def voice_models():
+    return jsonify({"success": True, **voice_backend_status()})
 
 
 @app.post("/api/upload")
@@ -1284,6 +1467,19 @@ def import_youtube_video():
                     raise RuntimeError("No encontre el archivo descargado.")
                 downloaded = candidates[0]
 
+            # Verificacion critica: el archivo bajado debe tener audio.
+            # TikTok no-watermark stream a veces es video-only; YouTube Shorts HEVC
+            # tambien. Sin esta verificacion, los videos llegan mudos a la cola.
+            if not _video_file_has_audio(downloaded):
+                downloaded.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"El video descargado de {platform} llego sin audio. "
+                    "yt-dlp eligio un stream video-only (comun en versiones "
+                    "sin marca de agua de TikTok o en HEVC de Shorts). "
+                    "Re-intenta la importacion -- el proximo intento usara "
+                    "un formato distinto."
+                )
+
             safe_name = f"video_{job_id}_{secure_filename(downloaded.name)}"
             final_path = UPLOAD_FOLDER / safe_name
             if downloaded != final_path:
@@ -1310,8 +1506,120 @@ def import_youtube_video():
         except Exception as exc:
             set_job(job_id, status="error", progress=0, step="Error", error=clean_error_text(str(exc)))
 
-    threading.Thread(target=worker, daemon=True).start()
+    def _download_worker() -> None:
+        # Intentar obtener turno de descarga sin bloquear
+        acquired = _DOWNLOAD_SEM.acquire(blocking=False)
+        if not acquired:
+            # Todas las ranuras ocupadas: informar al usuario y esperar
+            set_job(job_id, status="queued", progress=0, step="Esperando turno de descarga")
+            _DOWNLOAD_SEM.acquire()
+        try:
+            worker()
+        finally:
+            _DOWNLOAD_SEM.release()
+
+    threading.Thread(target=_download_worker, daemon=True).start()
     return jsonify({"success": True, "job_id": job_id})
+
+
+def render_subtitle_preview(input_video: Path, subtitle_path: Path, output_path: Path, duration: float) -> None:
+    """Render a short vertical preview focused on subtitle timing/style."""
+    subtitle_file = VideoEditor._escape_filter_path(subtitle_path)
+    fonts_dir = VideoEditor._escape_filter_path(VideoEditor.SUBTITLE_FONTS_DIR)
+    video_filter = (
+        "scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos,"
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
+        f"ass=filename='{subtitle_file}':fontsdir='{fonts_dir}'"
+    )
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(input_video),
+        "-t",
+        f"{duration:.2f}",
+        "-vf",
+        video_filter,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        *VideoEditor._video_encoder_args(),
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        "-shortest",
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0 or not output_path.exists():
+        tail = (result.stderr or result.stdout or "").strip()[-1400:]
+        raise RuntimeError(f"No pude renderizar preview de subtitulos:\n{tail}")
+
+
+@app.post("/api/subtitles/preview")
+def preview_subtitles():
+    data = request.get_json(silent=True) or {}
+    input_video = Path(data.get("input_video", ""))
+    if not input_video.exists():
+        return jsonify({"error": "No encontre el video para preview."}), 400
+
+    job_id = uuid.uuid4().hex
+    preview_filename = f"preview_subs_{job_id[:8]}.mp4"
+    preview_path = OUTPUT_FOLDER / preview_filename
+    duration = max(5.0, min(30.0, float(data.get("duration", 18.0))))
+    offset_ms = max(-750.0, min(750.0, float(data.get("subtitle_offset_ms", 0.0))))
+    language_value = secure_filename(str(data.get("subtitle_language") or "original")) or "original"
+
+    set_job(
+        job_id,
+        status="queued",
+        progress=0,
+        step="En cola para preview",
+        kind="subtitle_preview",
+        output_filename=preview_filename,
+        output_path=str(preview_path),
+    )
+
+    def progress_callback(progress: int, step: str) -> None:
+        mapped = 5 + int((max(0, min(16, progress)) / 16) * 55)
+        set_job(job_id, status="processing", progress=mapped, step=step)
+
+    def worker() -> None:
+        temp_subtitle = OUTPUT_FOLDER / ".workfast_tmp" / f"preview_sub_{job_id}.ass"
+        temp_subtitle.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            set_job(job_id, status="processing", progress=2, step="Generando subtitulos de preview")
+            generate_subtitles(
+                input_video=input_video,
+                output_ass=temp_subtitle,
+                cache_dir=SUBTITLE_CACHE_FOLDER,
+                target_language=language_value,
+                progress_callback=progress_callback,
+                subtitle_offset_ms=offset_ms,
+            )
+            set_job(job_id, status="processing", progress=70, step="Renderizando preview")
+            render_subtitle_preview(input_video, temp_subtitle, preview_path, duration)
+            set_job(
+                job_id,
+                status="completed",
+                progress=100,
+                step="Preview listo",
+                preview_filename=preview_filename,
+                preview_url=f"/api/download/{preview_filename}",
+                download_url=f"/api/download/{preview_filename}",
+            )
+        except Exception as exc:
+            set_job(job_id, status="error", progress=0, step="Error", error=clean_error_text(str(exc)))
+        finally:
+            temp_subtitle.unlink(missing_ok=True)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({"success": True, "job_id": job_id, "preview_filename": preview_filename})
 
 
 @app.post("/api/process")
@@ -1322,7 +1630,8 @@ def process_video():
     if not input_video.exists():
         return jsonify({"error": "No encontre el video de entrada."}), 400
 
-    title_text = data.get("title_text") or title_from_filename(input_video.name)
+    provided_title = data.get("title_text")
+    title_text = provided_title if provided_title is not None else title_from_filename(input_video.name)
     output_base = output_name_from_title(title_text, input_video.stem)
     output_filename = f"{output_base}_{uuid.uuid4().hex[:6]}.mp4"
     output_path = OUTPUT_FOLDER / output_filename
@@ -1337,63 +1646,169 @@ def process_video():
         output_path=str(output_path),
         kind="render",
     )
+    _begin_cancellable_job(job_id)
 
     def progress_callback(progress: int, step: str) -> None:
-        set_job(job_id, status="processing", progress=progress, step=step)
+        set_job_progress(job_id, progress, step)
+
+    def raise_if_cancelled(stage: str = "") -> None:
+        """Aborta el worker si el usuario cancelo. Se llama entre etapas."""
+        if _job_is_cancelled(job_id):
+            raise RenderCancelled(stage or "cancelado")
 
     def worker() -> None:
         subtitle_path: Path | None = None
         subtitle_filename: str | None = None
         subtitle_warning: str | None = None
+        enhanced_video: Path = input_video
+        working_input = input_video
+        trimmed_video: Path | None = None
+
+        # Serializar el render: solo uno toca la GPU a la vez. Si hay otro
+        # activo, este job espera aca mostrandose "En cola" al usuario.
+        sem_acquired = _RENDER_SEM.acquire(blocking=False)
+        if not sem_acquired:
+            set_job(job_id, status="queued", progress=0, step=f"Esperando turno (límite de {_MAX_PARALLEL_RENDERS} renders activo)")
+            _RENDER_SEM.acquire()
+            sem_acquired = True
         try:
+            # Si lo cancelaron mientras esperaba el semaforo, salir limpio.
+            if _job_is_cancelled(job_id):
+                raise RenderCancelled("cancelado mientras esperaba el turno")
             set_job(job_id, status="processing", progress=1, step="Iniciando")
-            if data.get("generate_subtitles"):
-                set_job(job_id, status="processing", progress=2, step="Generando subtitulos")
+
+            remove_silences = bool(data.get("remove_silences", False))
+            silence_threshold_db = float(data.get("silence_threshold_db", -32.0))
+            silence_min_duration = float(data.get("silence_min_duration", 0.45))
+            enhance_profile = normalize_enhancer_profile(str(data.get("enhance_profile") or ""))
+
+            if remove_silences:
+                set_job(job_id, status="processing", progress=2, step="Recortando silencios")
+                trim_probe_output = OUTPUT_FOLDER / ".workfast_tmp" / f"trim_probe_{job_id}.mp4"
+                trim_editor = VideoEditor(
+                    input_video=input_video,
+                    output_path=trim_probe_output,
+                    progress_callback=progress_callback,
+                )
+                try:
+                    if trim_editor.has_audio:
+                        candidate = trim_editor._strip_silences(
+                            input_video,
+                            threshold_db=silence_threshold_db,
+                            min_duration=silence_min_duration,
+                        )
+                        if candidate != input_video and candidate.exists():
+                            trimmed_video = OUTPUT_FOLDER / ".workfast_tmp" / f"trim_{job_id}.mp4"
+                            trimmed_video.parent.mkdir(parents=True, exist_ok=True)
+                            if trimmed_video.exists():
+                                trimmed_video.unlink()
+                            shutil.move(str(candidate), str(trimmed_video))
+                            working_input = trimmed_video
+                finally:
+                    shutil.rmtree(trim_editor.temp_dir, ignore_errors=True)
+
+            # ── Auto-deteccion de subtitulos quemados en la fuente ──────────
+            # Muchos shorts ya traen subtitulos incrustados. Si vamos a poner los
+            # nuestros, taparlos evita el doble subtitulo. Deteccion liviana (~1s):
+            # solo se activa si el usuario NO marco el toggle manual y SI vamos a
+            # generar subtitulos. Desactivable con auto_cover_existing_subs=false.
+            effective_remove_subs = bool(data.get("remove_existing_subtitles", False))
+            if (not effective_remove_subs
+                    and data.get("generate_subtitles")
+                    and bool(data.get("auto_cover_existing_subs", True))):
+                try:
+                    from video_processor.subtitle_detect import detect_burned_in_subtitles
+                    set_job_progress(job_id, 3, "Revisando si el original ya trae subtitulos")
+                    det = detect_burned_in_subtitles(working_input)
+                    if det.get("present"):
+                        effective_remove_subs = True
+                        conf = det.get("confidence")
+                        set_job_progress(job_id, 4, f"Subtitulos detectados en el original (conf {conf}); tapandolos")
+                except Exception:
+                    pass
+
+            def subtitle_progress(progress: int, step: str) -> None:
+                mapped = 4 + int((max(0, min(16, progress)) / 16) * 26)
+                set_job_progress(job_id, mapped, step)
+
+            def enhancer_progress(_progress: int, step: str) -> None:
+                mapped = 10 + int((max(0, min(100, _progress)) / 100) * 60)
+                set_job_progress(job_id, mapped, step)
+
+            def render_progress(progress: int, step: str) -> None:
+                mapped = 70 + int((max(0, min(100, progress)) / 100) * 29)
+                set_job_progress(job_id, mapped, step)
+
+            def build_subtitles() -> tuple[Path | None, str | None, str | None]:
+                if not data.get("generate_subtitles"):
+                    return None, None, None
                 subtitle_target = output_path.with_suffix(".ass")
                 temp_subtitle = OUTPUT_FOLDER / ".workfast_tmp" / f"sub_{job_id}.ass"
                 temp_subtitle.parent.mkdir(parents=True, exist_ok=True)
                 language_value = secure_filename(str(data.get("subtitle_language") or "original")) or "original"
                 try:
-                    subtitle_path = generate_subtitles(
-                        input_video=input_video,
+                    created = generate_subtitles(
+                        input_video=working_input,
                         output_ass=temp_subtitle,
                         cache_dir=SUBTITLE_CACHE_FOLDER,
                         target_language=language_value,
-                        progress_callback=progress_callback,
+                        progress_callback=subtitle_progress,
+                        subtitle_offset_ms=float(data.get("subtitle_offset_ms", 0.0)),
                     )
-                    subtitle_filename = subtitle_target.name
-                    shutil.copy2(subtitle_path, OUTPUT_FOLDER / subtitle_filename)
-                except TranscriberError as sub_exc:
-                    subtitle_warning = str(sub_exc)
-                    subtitle_path = None
-                    set_job(job_id, status="processing", progress=10, step="Sin subtitulos (fallo IA)")
+                    shutil.copy2(created, OUTPUT_FOLDER / subtitle_target.name)
+                    return created, subtitle_target.name, None
+                except (TranscriberError, Exception) as sub_exc:
+                    return None, None, str(sub_exc)
 
-            enhanced_video = input_video
-            if data.get("enhance_with_ai", True):
-                set_job(job_id, status="processing", progress=15, step="Mejorando calidad con IA")
+            def build_enhanced_video() -> Path:
+                if not data.get("enhance_with_ai", True):
+                    return working_input
+                enhanced_target = OUTPUT_FOLDER / ".workfast_tmp" / f"enh_{job_id}.mp4"
+                enhanced_target.parent.mkdir(parents=True, exist_ok=True)
+                print(f"[ENHANCER] Procesando {Path(working_input).name} con perfil {enhance_profile}...")
                 try:
-                    enhanced_target = OUTPUT_FOLDER / ".workfast_tmp" / f"enh_{job_id}.mp4"
-                    enhanced_target.parent.mkdir(parents=True, exist_ok=True)
-                    print(f"[ENHANCER] Procesando {Path(input_video).name} con Real-ESRGAN...")
-                    enhanced_video = enhance_video(
-                        input_video=input_video,
+                    result = enhance_video(
+                        input_video=working_input,
                         output_video=enhanced_target,
-                        progress_callback=progress_callback,
+                        profile=enhance_profile,
+                        progress_callback=enhancer_progress,
                     )
-                    if enhanced_video and Path(enhanced_video).exists():
-                        size_mb = Path(enhanced_video).stat().st_size / 1024 / 1024
-                        print(f"[ENHANCER] OK: {Path(enhanced_video).name} ({size_mb:.1f} MB)")
-                    else:
-                        print(f"[ENHANCER] No se genero salida, usando original")
-                        enhanced_video = input_video
+                    if result and Path(result).exists():
+                        size_mb = Path(result).stat().st_size / 1024 / 1024
+                        print(f"[ENHANCER] OK: {Path(result).name} ({size_mb:.1f} MB)")
+                        return Path(result)
+                    print("[ENHANCER] No se genero salida, usando entrada preparada")
                 except EnhancerError as enh_exc:
                     print(f"[ENHANCER] WARNING: {enh_exc}")
-                    enhanced_video = input_video
                 except Exception as enh_exc:
                     print(f"[ENHANCER] EXCEPCION: {enh_exc}")
                     import traceback
                     traceback.print_exc()
-                    enhanced_video = input_video
+                return working_input
+
+            parallel_tasks: dict = {}
+            can_parallel_gpu = os.getenv("WORKFAST_GPU_PARALLEL", "0") == "1" or enhance_profile == "fast"
+            if data.get("generate_subtitles") and data.get("enhance_with_ai", True) and can_parallel_gpu:
+                set_job(job_id, status="processing", progress=4, step="Subtitulos y mejora IA en paralelo")
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    parallel_tasks[executor.submit(build_subtitles)] = "subtitles"
+                    parallel_tasks[executor.submit(build_enhanced_video)] = "enhance"
+                    for future in as_completed(parallel_tasks):
+                        task_name = parallel_tasks[future]
+                        if task_name == "subtitles":
+                            subtitle_path, subtitle_filename, subtitle_warning = future.result()
+                            if subtitle_warning:
+                                set_job_progress(job_id, 10, "Sin subtitulos (fallo IA)")
+                        else:
+                            enhanced_video = future.result()
+            else:
+                if data.get("generate_subtitles"):
+                    subtitle_path, subtitle_filename, subtitle_warning = build_subtitles()
+                    if subtitle_warning:
+                        set_job_progress(job_id, 10, "Sin subtitulos (fallo IA)")
+                enhanced_video = build_enhanced_video()
+
+            raise_if_cancelled("antes de renderizar")
 
             editor = VideoEditor(
                 input_video=enhanced_video,
@@ -1402,7 +1817,9 @@ def process_video():
                 ending_path=data.get("ending_path") or None,
                 follow_image_path=data.get("follow_image_path") or None,
                 subtitle_path=subtitle_path,
-                progress_callback=progress_callback,
+                progress_callback=render_progress,
+                cancel_check=lambda: _job_is_cancelled(job_id),
+                on_process_start=lambda proc: _register_job_process(job_id, proc),
             )
             editor.process_complete(
                 title_text=title_text,
@@ -1416,15 +1833,22 @@ def process_video():
                 voice_preset=str(data.get("voice_preset", "")),
                 filter_intensity=float(data.get("filter_intensity", 0.55)),
                 title_interval=float(data.get("title_interval", 10)),
-                remove_existing_subtitles=bool(data.get("remove_existing_subtitles", False)),
+                remove_existing_subtitles=effective_remove_subs,
                 burn_subtitles=bool(data.get("burn_subtitles", True)),
-                remove_silences=bool(data.get("remove_silences", False)),
-                silence_threshold_db=float(data.get("silence_threshold_db", -32.0)),
-                silence_min_duration=float(data.get("silence_min_duration", 0.45)),
+                remove_silences=False,
+                silence_threshold_db=silence_threshold_db,
+                silence_min_duration=silence_min_duration,
             )
 
             cleanup_outputs()
             cleanup_cache(SUBTITLE_CACHE_FOLDER)
+
+            # Auto-cleanup: deshabilitado para permitir multiples renders del mismo video.
+            # try:
+            #     if input_video and input_video.exists() and input_video.is_relative_to(UPLOAD_FOLDER):
+            #         input_video.unlink()
+            # except Exception:
+            #     pass  # no fatal si falla
 
             set_job(
                 job_id,
@@ -1435,13 +1859,45 @@ def process_video():
                 subtitle_filename=subtitle_filename,
                 subtitle_warning=subtitle_warning,
             )
+        except RenderCancelled:
+            # El usuario detuvo el render. Borrar el MP4 parcial (incompleto)
+            # para que no aparezca en Resultados.
+            set_job(job_id, status="cancelled", progress=0, step="Cancelado por el usuario")
+            try:
+                if output_path.exists():
+                    output_path.unlink()
+            except Exception:
+                pass
         except Exception as exc:
-            set_job(job_id, status="error", progress=0, step="Error", error=clean_error_text(str(exc)))
+            # Si fue cancelado mientras corria otra cosa (ej: FFmpeg killeado por
+            # el endpoint produjo un RuntimeError generico), tratarlo como cancel.
+            if _job_is_cancelled(job_id):
+                set_job(job_id, status="cancelled", progress=0, step="Cancelado por el usuario")
+                try:
+                    if output_path.exists():
+                        output_path.unlink()
+                except Exception:
+                    pass
+            else:
+                set_job(job_id, status="error", progress=0, step="Error", error=clean_error_text(str(exc)))
         finally:
+            if sem_acquired:
+                _RENDER_SEM.release()
+
+            def _delayed_clear() -> None:
+                time.sleep(3600)  # Mantener 1 hora por si la pestana del frontend esta inactiva
+                with jobs_lock:
+                    if job_id in jobs:
+                        del jobs[job_id]
+            threading.Thread(target=_delayed_clear, daemon=True).start()
+
+            _clear_job_tracking(job_id)
             if subtitle_path:
                 subtitle_path.unlink(missing_ok=True)
-            if 'enhanced_video' in locals() and enhanced_video != input_video and enhanced_video.exists():
+            if enhanced_video != input_video and enhanced_video != working_input and enhanced_video.exists():
                 enhanced_video.unlink(missing_ok=True)
+            if trimmed_video and trimmed_video.exists():
+                trimmed_video.unlink(missing_ok=True)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1463,6 +1919,38 @@ def get_job(job_id: str):
     return jsonify(job)
 
 
+@app.post("/api/jobs/<job_id>/cancel")
+def cancel_job_endpoint(job_id: str):
+    """Detiene un render en curso: setea el flag de cancelacion y mata el
+    FFmpeg activo de ese job. El worker lo ve, limpia y marca 'cancelled'."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job no encontrado."}), 404
+    if job.get("status") not in {"queued", "processing"}:
+        return jsonify({"error": "El job ya termino, no hay nada que detener."}), 400
+
+    # 1. Señalar cancelacion (el worker la consulta entre etapas)
+    ev = _job_cancel.get(job_id)
+    if ev is not None:
+        ev.set()
+
+    # 2. Matar cualquier FFmpeg activo de este job (corta el render YA)
+    with _job_proc_lock:
+        procs = list(_job_procs.get(job_id, []))
+    for proc in procs:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+
+    # 3. Marcar el job como cancelado (el worker tambien lo hara, pero
+    #    respondemos rapido para que la UI reaccione al instante).
+    set_job(job_id, status="cancelled", progress=0, step="Cancelado por el usuario")
+    return jsonify({"success": True})
+
+
 @app.get("/api/jobs")
 def list_jobs_endpoint():
     """Bulk job status endpoint so the frontend uses a single poll instead of N."""
@@ -1475,6 +1963,73 @@ def list_jobs_endpoint():
         else:
             data = {job_id: job for job_id, job in jobs.items() if job.get("status") in {"queued", "processing"}}
     return jsonify({"success": True, "jobs": data})
+
+
+@app.post("/api/session/reset")
+def reset_session():
+    """Limpia la sesion de trabajo actual: outputs renderizados, uploads
+    de YouTube/TikTok/FB pendientes y temporales. NO toca perfiles ni la
+    biblioteca de assets. Util al cambiar de canal sin reiniciar el server.
+
+    Rechaza con 409 si hay un job en curso (queued/processing) para no
+    borrar archivos que un render esta usando.
+    """
+    with jobs_lock:
+        active = [
+            job_id for job_id, job in jobs.items()
+            if job.get("status") in {"queued", "processing"}
+        ]
+    if active:
+        return jsonify({
+            "error": (
+                "Hay un render o importacion en curso. Espera a que termine "
+                "o cancelalo antes de reiniciar la sesion."
+            ),
+            "active_jobs": len(active),
+        }), 409
+
+    deleted = {"outputs": 0, "uploads": 0, "tmp": 0}
+    errors: list[str] = []
+
+    def _wipe(folder: Path, key: str) -> None:
+        if not folder.exists():
+            return
+        for item in folder.iterdir():
+            if item.name == ".gitkeep":
+                continue
+            try:
+                if item.is_file() or item.is_symlink():
+                    item.unlink(missing_ok=True)
+                    deleted[key] += 1
+                elif item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                    deleted[key] += 1
+            except Exception as exc:
+                errors.append(f"{item.name}: {exc}")
+
+    _wipe(OUTPUT_FOLDER, "outputs")
+    _wipe(UPLOAD_FOLDER, "uploads")
+    _wipe(BASE_DIR / ".tmp", "tmp")
+
+    with jobs_lock:
+        terminal = {"completed", "error", "cancelled", "done"}
+        for job_id in [jid for jid, job in jobs.items() if job.get("status") in terminal]:
+            jobs.pop(job_id, None)
+
+    return jsonify({
+        "success": True,
+        "deleted": deleted,
+        "errors": errors[:10],
+    })
+
+
+@app.get("/api/preview/<filename>")
+def preview_upload(filename: str):
+    """Serve an uploaded video for in-app preview (supports range requests for seeking)."""
+    filepath = UPLOAD_FOLDER / secure_filename(filename)
+    if not filepath.exists():
+        return jsonify({"error": "Archivo no encontrado."}), 404
+    return send_file(filepath, conditional=True)
 
 
 @app.get("/api/download/<filename>")
@@ -1490,7 +2045,7 @@ def download_bundle():
     data = request.get_json(silent=True) or {}
     filenames = data.get("filenames") or []
     safe_files = []
-    for filename in filenames[:5]:
+    for filename in filenames[:50]:
         filepath = OUTPUT_FOLDER / secure_filename(str(filename))
         if filepath.exists() and filepath.is_file():
             safe_files.append(filepath)
@@ -1498,43 +2053,607 @@ def download_bundle():
     if not safe_files:
         return jsonify({"error": "No hay videos listos para descargar."}), 400
 
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    # ZIP_STORED: sin compresion (los MP4 ya estan comprimidos — deflate no ayuda y tarda mucho).
+    # Se escribe en disco para no cargar GB en RAM.
+    tmp_dir = OUTPUT_FOLDER / ".workfast_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / f"bundle_{uuid.uuid4().hex}.zip"
+    with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as archive:
         for filepath in safe_files:
             archive.write(filepath, arcname=filepath.name)
-    buffer.seek(0)
 
+    _delayed_unlink(tmp_path, delay=7200.0)
     return send_file(
-        buffer,
+        tmp_path,
         as_attachment=True,
-        download_name=f"workfast_videos_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip",
+        download_name=f"evse_videos_{datetime.utcnow().strftime('%Y%m%d')}.zip",
         mimetype="application/zip",
     )
 
 
-if __name__ == "__main__":
-    # Banner de startup: muestra que backend de video y de subtitulos esta activo
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FACEBOOK PUBLISHER — accounts, queue, scheduler, routes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_fb_lock = threading.Lock()
+
+
+def _load_fb_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
     try:
-        nvenc_status = VideoEditor.get_nvenc_status()
-        whisper_info = describe_backend()
-        print()
-        print("  Evse Video Studio  -  http://127.0.0.1:5000")
-        print("  " + "-" * 48)
-        if nvenc_status.get("available"):
-            print("  Video    : GPU NVENC (rapido, GPU encoding)")
-        else:
-            print("  Video    : CPU libx264 (mas lento, CPU)")
-            err = nvenc_status.get("last_error")
-            if err:
-                print(f"             motivo: {err[:60]}")
-        device = whisper_info.get("device", "cpu")
-        model = whisper_info.get("model", "small")
-        if device == "cuda":
-            print(f"  Whisper  : GPU CUDA  (modelo {model}, rapido)")
-        else:
-            print(f"  Whisper  : CPU       (modelo {model})")
-        print("  " + "-" * 48)
-        print()
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_fb_json(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def fb_accounts_load() -> list[dict]:
+    return _load_fb_json(FB_ACCOUNTS_FILE).get("accounts", [])
+
+
+def fb_accounts_save(accounts: list[dict]) -> None:
+    _save_fb_json(FB_ACCOUNTS_FILE, {"accounts": accounts})
+
+
+def fb_queue_load() -> list[dict]:
+    return _load_fb_json(FB_QUEUE_FILE).get("items", [])
+
+
+def fb_queue_save(items: list[dict]) -> None:
+    _save_fb_json(FB_QUEUE_FILE, {"items": items})
+
+
+def fb_next_slot(page_id: str) -> datetime:
+    """Return next available 9am/1pm/7pm slot (local time) for this page."""
+    from datetime import date as _date
+    items = fb_queue_load()
+    occupied: set[str] = {
+        it["scheduled_time"]
+        for it in items
+        if it.get("page_id") == page_id and it.get("status") in {"pending", "uploading", "published"}
+    }
+    now = datetime.now()
+    # Search up to 60 days ahead
+    for day_offset in range(60):
+        day = now.date() if day_offset == 0 else (_date.fromordinal(now.date().toordinal() + day_offset))
+        for h, m in FB_DAILY_SLOTS:
+            candidate = datetime(day.year, day.month, day.day, h, m)
+            if candidate <= now:
+                continue
+            iso = candidate.strftime("%Y-%m-%dT%H:%M:00")
+            if iso not in occupied:
+                return candidate
+    return now  # fallback (should never reach here)
+
+
+def _fb_scheduler_loop() -> None:
+    """Background thread: publishes queue items when their scheduled time arrives."""
+    import time as _time
+    while True:
+        _time.sleep(60)
+        try:
+            _fb_scheduler_tick()
+        except Exception:
+            pass
+
+
+def _fb_scheduler_tick() -> None:
+    now_ts = datetime.now().timestamp()
+    with _fb_lock:
+        items = fb_queue_load()
+        due = [it for it in items if it.get("status") == "pending"
+               and it.get("scheduled_ts", 9e18) <= now_ts]
+        if not due:
+            return
+        for it in due:
+            it["status"] = "uploading"
+        fb_queue_save(items)
+
+    for item in due:
+        threading.Thread(target=_fb_publish_item, args=(item["id"],), daemon=True).start()
+
+
+def _fb_publish_item(item_id: str) -> None:
+    from facebook_publisher import upload_reel, check_video_status, FacebookAPIError
+
+    with _fb_lock:
+        items = fb_queue_load()
+        item = next((it for it in items if it["id"] == item_id), None)
+        if not item:
+            return
+
+    accounts = fb_accounts_load()
+    account = next((a for a in accounts if a["id"] == item.get("account_id")), None)
+    page = None
+    if account:
+        page = next((p for p in account.get("pages", []) if p["id"] == item.get("page_id")), None)
+
+    if not account or not page:
+        _fb_update_item(item_id, status="error", error="Cuenta o página no encontrada")
+        return
+
+    page_token = page.get("access_token", "")
+    if not page_token:
+        _fb_update_item(item_id, status="error", error="Token de página no configurado")
+        return
+
+    video_path = Path(item.get("video_path", ""))
+    if not video_path.exists():
+        _fb_update_item(item_id, status="error", error="Archivo de video no encontrado")
+        return
+
+    description = item.get("description", "")
+    hashtags = " ".join(item.get("hashtags", []))
+    full_desc = f"{description}\n\n{hashtags}".strip()
+
+    try:
+        result = upload_reel(
+            page_id=item["page_id"],
+            page_token=page_token,
+            video_path=video_path,
+            description=full_desc,
+            title=item.get("video_title", ""),
+        )
+        video_id = result.get("video_id", "")
+        _fb_update_item(item_id, status="published",
+                        fb_video_id=video_id,
+                        fb_post_id=result.get("post_id", ""),
+                        published_at=datetime.utcnow().isoformat() + "Z")
+
+        # Check copyright ~5 min after upload
+        def _check_copyright():
+            import time as _t
+            _t.sleep(300)
+            try:
+                status_data = check_video_status(video_id, page_token)
+                cr = status_data.get("copyright_check_status", {})
+                if cr.get("status") == "complete" and cr.get("matches_found"):
+                    _fb_update_item(item_id, status="copyright",
+                                    copyright_info=str(cr.get("matches_found", [])))
+            except Exception:
+                pass
+        threading.Thread(target=_check_copyright, daemon=True).start()
+
+    except FacebookAPIError as exc:
+        _fb_update_item(item_id, status="error", error=str(exc))
     except Exception as exc:
-        print(f"WorkFast server: http://127.0.0.1:5000  (banner failed: {exc})")
+        _fb_update_item(item_id, status="error", error=f"Error inesperado: {exc}")
+
+
+def _fb_update_item(item_id: str, **kwargs) -> None:
+    with _fb_lock:
+        items = fb_queue_load()
+        for it in items:
+            if it["id"] == item_id:
+                it.update(kwargs)
+                it["updated_at"] = datetime.utcnow().isoformat() + "Z"
+                break
+        fb_queue_save(items)
+
+
+# Start scheduler thread
+threading.Thread(target=_fb_scheduler_loop, daemon=True).start()
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@app.route("/api/fb/ollama-status")
+def fb_ollama_status():
+    from description_ai import check_ollama
+    return jsonify(check_ollama())
+
+
+@app.route("/api/fb/completed-videos")
+def fb_completed_videos():
+    files = sorted(
+        (p for p in OUTPUT_FOLDER.iterdir() if p.is_file() and p.suffix.lower() == ".mp4"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )[:100]
+    return jsonify([
+        {"filename": p.name, "size": p.stat().st_size,
+         "mtime": datetime.fromtimestamp(p.stat().st_mtime).isoformat()}
+        for p in files
+    ])
+
+
+@app.route("/api/fb/accounts", methods=["GET"])
+def fb_accounts_get():
+    return jsonify(fb_accounts_load())
+
+
+@app.route("/api/fb/accounts", methods=["POST"])
+def fb_accounts_add():
+    from facebook_publisher import get_pages, FacebookAPIError
+    body = request.get_json(force=True) or {}
+    name = str(body.get("name", "")).strip()
+    token = str(body.get("user_token", "")).strip()
+    if not name or not token:
+        return jsonify({"error": "name y user_token son requeridos"}), 400
+
+    try:
+        pages = get_pages(token)
+    except FacebookAPIError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": f"No se pudo conectar con Facebook: {exc}"}), 502
+
+    with _fb_lock:
+        accounts = fb_accounts_load()
+        account = {
+            "id": uuid.uuid4().hex,
+            "name": name,
+            "user_token": token,
+            "added_at": datetime.utcnow().isoformat() + "Z",
+            "pages": [
+                {"id": p["id"], "name": p["name"],
+                 "access_token": p.get("access_token", ""),
+                 "picture": p.get("picture", {}).get("data", {}).get("url", "") if isinstance(p.get("picture"), dict) else ""}
+                for p in pages
+            ],
+        }
+        accounts.append(account)
+        fb_accounts_save(accounts)
+
+    account_safe = {k: v for k, v in account.items() if k != "user_token"}
+    account_safe["pages_count"] = len(account["pages"])
+    return jsonify(account_safe), 201
+
+
+@app.route("/api/fb/accounts/<account_id>", methods=["DELETE"])
+def fb_accounts_delete(account_id):
+    with _fb_lock:
+        accounts = fb_accounts_load()
+        accounts = [a for a in accounts if a["id"] != account_id]
+        fb_accounts_save(accounts)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/fb/accounts/<account_id>/refresh", methods=["POST"])
+def fb_accounts_refresh(account_id):
+    from facebook_publisher import get_pages, FacebookAPIError
+    with _fb_lock:
+        accounts = fb_accounts_load()
+        account = next((a for a in accounts if a["id"] == account_id), None)
+        if not account:
+            return jsonify({"error": "Cuenta no encontrada"}), 404
+        try:
+            pages = get_pages(account["user_token"])
+        except FacebookAPIError as exc:
+            return jsonify({"error": str(exc)}), 400
+        account["pages"] = [
+            {"id": p["id"], "name": p["name"],
+             "access_token": p.get("access_token", ""),
+             "picture": p.get("picture", {}).get("data", {}).get("url", "") if isinstance(p.get("picture"), dict) else ""}
+            for p in pages
+        ]
+        fb_accounts_save(accounts)
+    return jsonify({"pages_count": len(account["pages"]), "pages": account["pages"]})
+
+
+@app.route("/api/fb/queue", methods=["GET"])
+def fb_queue_get():
+    return jsonify(fb_queue_load())
+
+
+@app.route("/api/fb/queue", methods=["POST"])
+def fb_queue_add():
+    body = request.get_json(force=True) or {}
+    account_id = str(body.get("account_id", "")).strip()
+    page_id = str(body.get("page_id", "")).strip()
+    video_filename = secure_filename(str(body.get("video_filename", "")).strip())
+    description = str(body.get("description", "")).strip()
+    hashtags = [str(h).strip() for h in (body.get("hashtags") or []) if str(h).strip().startswith("#")]
+
+    if not all([account_id, page_id, video_filename, description]):
+        return jsonify({"error": "account_id, page_id, video_filename y description son requeridos"}), 400
+    if len(hashtags) < 5:
+        return jsonify({"error": "Se requieren mínimo 5 hashtags"}), 400
+
+    video_path = OUTPUT_FOLDER / video_filename
+    if not video_path.exists():
+        return jsonify({"error": "Archivo de video no encontrado en outputs"}), 404
+
+    accounts = fb_accounts_load()
+    account = next((a for a in accounts if a["id"] == account_id), None)
+    if not account:
+        return jsonify({"error": "Cuenta no encontrada"}), 404
+    page = next((p for p in account.get("pages", []) if p["id"] == page_id), None)
+    if not page:
+        return jsonify({"error": "Página no encontrada en esta cuenta"}), 404
+
+    slot = fb_next_slot(page_id)
+    import calendar
+    scheduled_ts = int(calendar.timegm(slot.timetuple()))  # local→UTC not ideal; using as-is for scheduling
+
+    item = {
+        "id": uuid.uuid4().hex,
+        "account_id": account_id,
+        "account_name": account["name"],
+        "page_id": page_id,
+        "page_name": page["name"],
+        "video_path": str(video_path),
+        "video_filename": video_filename,
+        "video_title": video_filename.replace("_", " ").replace(".mp4", ""),
+        "description": description,
+        "hashtags": hashtags,
+        "scheduled_time": slot.strftime("%Y-%m-%dT%H:%M:00"),
+        "scheduled_ts": scheduled_ts,
+        "status": "pending",
+        "fb_video_id": None,
+        "fb_post_id": None,
+        "error": None,
+        "copyright_info": None,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "published_at": None,
+    }
+
+    with _fb_lock:
+        items = fb_queue_load()
+        items.append(item)
+        fb_queue_save(items)
+
+    return jsonify(item), 201
+
+
+@app.route("/api/fb/queue/<item_id>", methods=["DELETE"])
+def fb_queue_delete(item_id):
+    with _fb_lock:
+        items = fb_queue_load()
+        items = [it for it in items if it["id"] != item_id]
+        fb_queue_save(items)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/fb/generate-description", methods=["POST"])
+def fb_generate_description():
+    from description_ai import generate_description
+    body = request.get_json(force=True) or {}
+    title = str(body.get("title", "")).strip()
+    transcript = str(body.get("transcript", "")).strip()
+    model = str(body.get("model", "")).strip() or None
+
+    if not title:
+        return jsonify({"error": "title es requerido"}), 400
+
+    kwargs = {}
+    if model:
+        kwargs["model"] = model
+
+    try:
+        result = generate_description(title, transcript, **kwargs)
+        return jsonify(result)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except Exception as exc:
+        return jsonify({"error": f"Error generando descripción: {exc}"}), 500
+
+
+@app.route("/api/fb/next-slot")
+def fb_next_slot_route():
+    page_id = request.args.get("page_id", "")
+    if not page_id:
+        return jsonify({"error": "page_id requerido"}), 400
+    slot = fb_next_slot(page_id)
+    return jsonify({"scheduled_time": slot.strftime("%Y-%m-%dT%H:%M:00"),
+                    "display": slot.strftime("%a %d/%m · %I:%M %p")})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHORTS HUNTER — Gestion de canales para reciclar contenido
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_hunter_channels() -> list[dict]:
+    if not HUNTER_CHANNELS_FILE.exists():
+        return []
+    try:
+        data = json.loads(HUNTER_CHANNELS_FILE.read_text(encoding="utf-8"))
+        return data.get("channels", []) if isinstance(data, dict) else []
+    except Exception:
+        return []
+
+
+def _save_hunter_channels(channels: list[dict]) -> None:
+    HUNTER_CHANNELS_FILE.write_text(
+        json.dumps({"channels": channels}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _load_hunter_seed() -> list[dict]:
+    """Lista pre-curada de canales sugeridos por idioma+nicho."""
+    if not HUNTER_SEED_FILE.exists():
+        return []
+    try:
+        data = json.loads(HUNTER_SEED_FILE.read_text(encoding="utf-8"))
+        return data.get("channels", []) if isinstance(data, dict) else []
+    except Exception:
+        return []
+
+
+@app.get("/api/hunter/channels")
+def hunter_list_channels():
+    """Devuelve canales guardados por el usuario."""
+    return jsonify({"channels": _load_hunter_channels()})
+
+
+@app.post("/api/hunter/channels")
+def hunter_add_channel():
+    """Guardar un canal favorito. Body: {url, name, language, niche, platform}."""
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+    if not is_supported_video_url(url):
+        return jsonify({"error": "URL invalida."}), 400
+
+    channels = _load_hunter_channels()
+    # No duplicar
+    if any(c.get("url") == url for c in channels):
+        return jsonify({"error": "Ese canal ya esta guardado."}), 400
+
+    channel = {
+        "id": uuid.uuid4().hex,
+        "url": url,
+        "name": str(data.get("name", "")).strip()[:80] or url[:80],
+        "language": str(data.get("language", "")).strip()[:5].lower(),
+        "niche": str(data.get("niche", "")).strip()[:40],
+        "platform": detect_platform(url),
+        "added_at": datetime.utcnow().isoformat() + "Z",
+    }
+    channels.append(channel)
+    _save_hunter_channels(channels)
+    return jsonify({"success": True, "channel": channel}), 201
+
+
+@app.delete("/api/hunter/channels/<channel_id>")
+def hunter_delete_channel(channel_id: str):
+    channels = _load_hunter_channels()
+    new_channels = [c for c in channels if c.get("id") != channel_id]
+    if len(new_channels) == len(channels):
+        return jsonify({"error": "Canal no encontrado."}), 404
+    _save_hunter_channels(new_channels)
+    return jsonify({"success": True})
+
+
+@app.get("/api/hunter/suggested")
+def hunter_suggested():
+    """Devuelve canales sugeridos (lista pre-curada). Filtros por query string."""
+    language = request.args.get("language", "").lower().strip()
+    niche = request.args.get("niche", "").lower().strip()
+    seed = _load_hunter_seed()
+    results = []
+    for ch in seed:
+        if language and ch.get("language", "").lower() != language:
+            continue
+        if niche and niche not in ch.get("niche", "").lower():
+            continue
+        results.append(ch)
+    return jsonify({"channels": results, "count": len(results)})
+
+
+# Mapeo de nichos -> queries de busqueda por idioma. Construido a partir de
+# lenguaje natural que usan los creadores en cada plataforma/idioma.
+HUNTER_NICHE_QUERIES = {
+    "reddit":        {"en": "reddit stories drama",       "de": "reddit geschichten",      "pt": "histórias do reddit drama",  "es": "historias reddit drama",       "fr": "histoires reddit"},
+    "curiosities":   {"en": "did you know facts",         "de": "wusstest du fakten",      "pt": "você sabia curiosidades",    "es": "sabías que curiosidades",      "fr": "le saviez-vous"},
+    "true_crime":    {"en": "true crime short",           "de": "wahre verbrechen",        "pt": "casos reais crime",          "es": "casos reales crimen",          "fr": "chroniques criminelles"},
+    "sitcom":        {"en": "tbbt friends sitcom clips",  "de": "sitcom clips deutsch",    "pt": "sitcom clipes",              "es": "sitcom mejores momentos",      "fr": "sitcom moments"},
+    "motivational":  {"en": "motivational speech short",  "de": "motivation deutsch",      "pt": "motivacional curto",         "es": "motivacional discurso",        "fr": "motivation discours"},
+    "cooking":       {"en": "quick recipe short",         "de": "schnelles rezept",        "pt": "receita rápida",             "es": "receta rápida",                "fr": "recette rapide"},
+    "animals":       {"en": "cute animals funny",         "de": "lustige tiere",           "pt": "animais engraçados",         "es": "animales graciosos",           "fr": "animaux drôles"},
+    "history":       {"en": "history facts short",        "de": "geschichte fakten",       "pt": "fatos históricos",           "es": "datos históricos",             "fr": "faits historiques"},
+}
+
+
+@app.post("/api/hunter/live-search")
+def hunter_live_search():
+    """Busca shorts en vivo en YouTube/TikTok usando yt-dlp.
+
+    Body: {language, niche, custom_query?, max_results?, platform?}
+    Returns: {videos: [...], query: str}
+    """
+    data = request.get_json(silent=True) or {}
+    language = str(data.get("language", "en")).lower().strip()
+    niche = str(data.get("niche", "")).lower().strip()
+    custom_query = str(data.get("custom_query", "")).strip()
+    max_results = max(5, min(50, int(data.get("max_results", 30))))
+    platform = str(data.get("platform", "youtube")).lower().strip()
+
+    # Construir query
+    if custom_query:
+        query = custom_query
+    elif niche and niche in HUNTER_NICHE_QUERIES:
+        query = HUNTER_NICHE_QUERIES[niche].get(language) or HUNTER_NICHE_QUERIES[niche].get("en", niche)
+    else:
+        return jsonify({"error": "Selecciona un nicho o escribe una busqueda."}), 400
+
+    # yt-dlp soporta "ytsearch<N>:<query>" como pseudo-URL para buscar en YouTube
+    # Para shorts, agregamos "#shorts" al query (truco para sesgar a videos verticales)
+    search_query = f"ytsearch{max_results}:{query} #shorts"
+
+    try:
+        with YoutubeDL({
+            "extract_flat": True,
+            "quiet": True,
+            "noprogress": True,
+            "no_warnings": True,
+            "ignoreerrors": True,
+            "default_search": "ytsearch",
+        }) as ydl:
+            info = ydl.extract_info(search_query, download=False)
+
+        entries = info.get("entries", []) if isinstance(info, dict) else []
+        videos = []
+        for entry in entries:
+            if not entry:
+                continue
+            normalized = normalize_youtube_entry(entry, "youtube")
+            if normalized.get("url"):
+                videos.append(normalized)
+
+        return jsonify({
+            "success": True,
+            "videos": videos,
+            "count": len(videos),
+            "query": query,
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Error en búsqueda: {clean_error_text(str(exc))}"}), 500
+
+
+if __name__ == "__main__":
+    # Limpieza de temporales y basura en cada inicio
+    import shutil
+    for folder in [".tmp", "assets/outputs"]:
+        p = Path(folder)
+        if p.exists():
+            for item in p.iterdir():
+                if item.is_file() and item.name != ".gitkeep":
+                    try: item.unlink()
+                    except: pass
+                elif item.is_dir():
+                    try: shutil.rmtree(item)
+                    except: pass
+
+    # Basura de uploads/: .part de yt-dlp interrumpidos, .ytdl manifests
+    orphans_removed = cleanup_orphan_uploads()
+    if orphans_removed:
+        print(f"  Limpieza: {orphans_removed} descargas incompletas borradas de uploads/")
+
+    # Banner de startup en BACKGROUND: get_nvenc_status() corre un encode de
+    # prueba con FFmpeg (~1-2s) y describe_backend() consulta CUDA. Antes corrian
+    # ANTES de app.run(), retrasando el arranque del server ~3-5s (y la ventana
+    # del launcher esperaba a /api/health). Ahora arrancan en un thread aparte:
+    # el server responde de inmediato y el banner se imprime cuando termine.
+    def _print_startup_banner() -> None:
+        try:
+            nvenc_status = VideoEditor.get_nvenc_status()
+            whisper_info = describe_backend()
+            print()
+            print("  Evse Video Studio  -  http://127.0.0.1:5000")
+            print("  " + "-" * 48)
+            if nvenc_status.get("available"):
+                print("  Video    : GPU NVENC (rapido, GPU encoding)")
+            else:
+                print("  Video    : CPU libx264 (mas lento, CPU)")
+                err = nvenc_status.get("last_error")
+                if err:
+                    print(f"             motivo: {err[:60]}")
+            device = whisper_info.get("device", "cpu")
+            model = whisper_info.get("model", "small")
+            if device == "cuda":
+                print(f"  Whisper  : GPU CUDA  (modelo {model}, rapido)")
+            else:
+                print(f"  Whisper  : CPU       (modelo {model})")
+            print("  " + "-" * 48)
+            print()
+        except Exception as exc:
+            print(f"Evse server: banner failed: {exc}")
+
+    print("Evse Video Studio  -  http://127.0.0.1:5000 (iniciando...)")
+    threading.Thread(target=_print_startup_banner, daemon=True).start()
     app.run(debug=False, host="127.0.0.1", port=5000, threaded=True, use_reloader=False)

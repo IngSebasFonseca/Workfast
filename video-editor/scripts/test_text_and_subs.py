@@ -87,10 +87,10 @@ def subtitle_lag_cases() -> int:
 
     # Verifica que el .ass no tenga +0.05 padding
     ass = build_ass(phrases)
-    if "fad(60,40)" in ass:
-        print("  [OK] fade-out reducido a 40ms")
+    if "fad(25,25)" in ass:
+        print("  [OK] fade minimo 25ms para habla rapida")
     else:
-        print("  [FAIL] no se encontro fad(60,40) en .ass")
+        print("  [FAIL] no se encontro fad(25,25) en .ass")
         failed += 1
     return failed
 

@@ -1,6 +1,7 @@
 """ASS subtitle generator with Opus Clips style word-by-word karaoke highlighting."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -71,25 +72,57 @@ def _tighten_word_ends(
     return cleaned
 
 
+def _subtitle_lead_seconds() -> float:
+    """Small negative display offset so captions feel locked to fast speech."""
+    raw = os.getenv("WORKFAST_SUBTITLE_LEAD_MS", "140").strip()
+    try:
+        lead_ms = float(raw)
+    except ValueError:
+        lead_ms = 140.0
+    return max(0.0, min(350.0, lead_ms)) / 1000.0
+
+
+def _shift_word_timings(words: Sequence[Word], offset_seconds: float) -> list[Word]:
+    """Shift display timing. Negative = earlier, positive = later."""
+    if abs(offset_seconds) <= 0.001:
+        return list(words)
+    shifted: list[Word] = []
+    for word in words:
+        start = max(0.0, word.start + offset_seconds)
+        end = max(start + 0.05, word.end + offset_seconds)
+        shifted.append(Word(text=word.text, start=start, end=end))
+    return shifted
+
+
 def group_words_into_phrases(
     words: Sequence[Word],
     *,
-    max_words: int = 3,
-    max_chars: int = 22,
-    max_duration: float = 1.4,
-    pause_split: float = 0.45,
+    max_words: int = 2,
+    max_chars: int = 20,
+    max_duration: float = 1.05,
+    pause_split: float = 0.32,
     tighten: bool = True,
+    lead_seconds: float | None = None,
+    timing_offset_seconds: float | None = None,
+    manual_offset_seconds: float = 0.0,
 ) -> list[Phrase]:
     """Group whisper word-level timestamps into short phrases for the screen.
 
-    Uses Opus Clips heuristics: 1-3 words per phrase, break on long pauses,
-    keep each phrase under ~22 chars and ~1.4s of duration.
-    Si `tighten=True` recorta los ends de palabra (anti-lag).
+    Uses Opus Clips heuristics: 1-2 words per phrase, break on short pauses,
+    keep each phrase under ~20 chars and ~1.05s of duration.
+    Si `tighten=True` recorta los ends de palabra (anti-lag). Por defecto el
+    texto se adelanta con `WORKFAST_SUBTITLE_LEAD_MS`; `manual_offset_seconds`
+    suma un ajuste fino: negativo adelanta, positivo atrasa.
     """
     if not words:
         return []
     if tighten:
         words = _tighten_word_ends(words)
+    if timing_offset_seconds is None:
+        if lead_seconds is None:
+            lead_seconds = _subtitle_lead_seconds()
+        timing_offset_seconds = -lead_seconds
+    words = _shift_word_timings(words, timing_offset_seconds + manual_offset_seconds)
     phrases: list[Phrase] = []
     current: list[Word] = []
     for word in words:
@@ -180,6 +213,11 @@ def build_ass(
     return header + "\n".join(events) + "\n"
 
 
+# Color de palabra aun-no-dicha: blanco translucido (alpha alto = mas transparente).
+# Hace que el ojo siga el ritmo: lo no dicho se ve atenuado, lo dicho queda solido.
+_PENDING_ALPHA = "&H70&"   # ~44% visible
+
+
 def _render_phrase_event(
     phrase: Phrase,
     highlight_color: str,
@@ -190,21 +228,33 @@ def _render_phrase_event(
     # Asi los subtitulos se cierran junto con la voz (anti-lag).
     end_ts = _format_timestamp(phrase.end)
 
-    # Build a karaoke-style line where each word lights up at its own timestamp.
-    # Fade-in 60ms / fade-out 40ms: entrada nitida, salida casi instantanea.
-    line_parts: list[str] = ["{\\fad(60,40)}"]
+    # Caption viral estilo TikTok/Opus Clip:
+    #   - La frase entra con un pop (\fad + escala 90->100).
+    #   - Cada palabra aun-no-dicha se ve atenuada (alpha).
+    #   - Al decirse: POP con rebote (132% -> 113%) + color highlight + opaca.
+    #   - Al terminar: vuelve a blanco solido tamano normal (queda legible).
     base_start = phrase.start
+    # Entrada de la frase: fade corto + micro pop de escala global.
+    line_parts: list[str] = ["{\\fad(60,30)\\fscx90\\fscy90\\t(0,90,\\fscx100\\fscy100)}"]
+
     for index, word in enumerate(phrase.words):
         word_start_cs = max(0, int((word.start - base_start) * 100))
         word_end_cs = max(word_start_cs + 1, int((word.end - base_start) * 100))
-        # Inactive: white. At word_start: switch color + scale up. At word_end: revert.
+        pop_top = word_start_cs + 8       # cima del salto
+        pop_settle = word_start_cs + 18   # asentado tras el rebote
+        # Estado inicial: atenuada (si aun no es la primera palabra ya activa).
+        # Pop con rebote al decirse, y vuelta a blanco solido al terminar.
         line_parts.append(
-            "{\\t("
-            f"{word_start_cs},{word_start_cs + 5},"
-            f"\\1c{highlight_color}\\fscx112\\fscy112)"
-            "\\t("
-            f"{word_end_cs},{word_end_cs + 5},"
-            f"\\1c{primary_color}\\fscx100\\fscy100)"
+            "{"
+            f"\\alpha{_PENDING_ALPHA}"
+            # aparece nitida justo antes de su pop (anti-flash en habla rapida)
+            f"\\t({max(0, word_start_cs - 4)},{word_start_cs},\\alpha&H00&)"
+            # POP: salta a 132% + color highlight
+            f"\\t({word_start_cs},{pop_top},\\fscx132\\fscy132\\1c{highlight_color}\\alpha&H00&)"
+            # REBOTE: asienta a 113%
+            f"\\t({pop_top},{pop_settle},\\fscx113\\fscy113)"
+            # FIN: vuelve a 100% blanco solido (queda legible el resto de la frase)
+            f"\\t({word_end_cs},{word_end_cs + 7},\\fscx100\\fscy100\\1c{primary_color})"
             "}"
         )
         line_parts.append(_ass_escape(word.text))
